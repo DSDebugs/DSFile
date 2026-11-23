@@ -1,0 +1,1439 @@
+#import "WQMStorageChangesViewController.h"
+#import "WQMBackupQueueViewController.h"
+#import "WQMBackupSelectionViewController.h"
+#import "WQMFilesViewController.h"
+#import "WQMExportCenterViewController.h"
+#import "WQMFileAuditViewController.h"
+#import "WQMGlobalFileSearchViewController.h"
+#import "WQMAppsViewController.h"
+#import "WQMAppModel.h"
+#import "WQMAppScanner.h"
+#import "WQMAccessViewController.h"
+#import "WQMFilePreviewViewController.h"
+#import "WQMAppCache.h"
+#import "WQMAppIconService.h"
+#import "WQMAppActionsViewController.h"
+#import "WQMSpaceLensViewController.h"
+#import "WQMBackupService.h"
+#import "WQMBackupStore.h"
+#import "WQMLanguageManager.h"
+#import "WQMRestoreService.h"
+#import "WQMLoadController.h"
+#import "WQMLongOperationBanner.h"
+#import "WQMAlertPresenter.h"
+#import "WQMSafetyPolicy.h"
+#import "WQMTheme.h"
+#import "WQAccess.h"
+
+static dispatch_queue_t WQMIndexSaveQueue(void)
+{
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("mumu.wqmanager.index-save", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+static NSString *WQMLoadProfileName(WQMLoadProfile profile)
+{
+    switch (profile) {
+        case WQMLoadProfileStandard: return WQML(@"LOAD_PROFILE_STANDARD", @"标准");
+        case WQMLoadProfileLowLoad: return WQML(@"LOAD_PROFILE_LOWLOAD", @"低负载");
+        case WQMLoadProfileAutomatic:
+        default: return WQML(@"LOAD_PROFILE_AUTOMATIC", @"自动");
+    }
+}
+
+static NSString *WQMLoadProfileConfirmationLine(void)
+{
+    return [NSString stringWithFormat:@"\n\n%@",
+            [NSString stringWithFormat:WQML(@"LOAD_PROFILE_CONFIRM", @"负载模式：%@"),
+             WQMLoadProfileName(WQMLoadProfileCurrent())]];
+}
+
+typedef NS_ENUM(NSInteger, WQMAppSizeFilter) {
+    WQMAppSizeFilterAll = 0,
+    WQMAppSizeFilterLarge,
+    WQMAppSizeFilterMedium,
+    WQMAppSizeFilterSmall,
+    WQMAppSizeFilterUnknown,
+};
+
+typedef NS_ENUM(NSInteger, WQMAppSourceFilter) {
+    WQMAppSourceFilterAll = 0,
+    WQMAppSourceFilterSystem,
+    WQMAppSourceFilterThirdParty,
+};
+
+static const unsigned long long kWQMAppSizeThresholdLarge = 1024ULL * 1024 * 1024;   // 1 GB
+static const unsigned long long kWQMAppSizeThresholdMedium = 100ULL * 1024 * 1024;   // 100 MB
+
+static NSString * const kWQMAppSizeFilterKey = @"WQMAppSizeFilter";
+static NSString * const kWQMAppSourceFilterKey = @"WQMAppSourceFilter";
+static NSString * const kWQMAppSortOrderKey = @"WQMAppSortOrder";
+
+static WQMAppSizeFilter WQMAppStoredSizeFilter(void)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:kWQMAppSizeFilterKey];
+    if (![value isKindOfClass:NSNumber.class]) return WQMAppSizeFilterAll;
+    NSInteger raw = [value integerValue];
+    if (raw < WQMAppSizeFilterAll || raw > WQMAppSizeFilterUnknown) return WQMAppSizeFilterAll;
+    return (WQMAppSizeFilter)raw;
+}
+
+static void WQMAppStoreSizeFilter(WQMAppSizeFilter filter)
+{
+    [NSUserDefaults.standardUserDefaults setInteger:filter forKey:kWQMAppSizeFilterKey];
+}
+
+static WQMAppSourceFilter WQMAppStoredSourceFilter(void)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:kWQMAppSourceFilterKey];
+    if (![value isKindOfClass:NSNumber.class]) return WQMAppSourceFilterAll;
+    NSInteger raw = [value integerValue];
+    if (raw < WQMAppSourceFilterAll || raw > WQMAppSourceFilterThirdParty) return WQMAppSourceFilterAll;
+    return (WQMAppSourceFilter)raw;
+}
+
+static void WQMAppStoreSourceFilter(WQMAppSourceFilter filter)
+{
+    [NSUserDefaults.standardUserDefaults setInteger:filter forKey:kWQMAppSourceFilterKey];
+}
+
+static WQMAppSortOrder WQMAppStoredSortOrder(void)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:kWQMAppSortOrderKey];
+    if (![value isKindOfClass:NSNumber.class]) return WQMAppSortOrderDefault;
+    NSInteger raw = [value integerValue];
+    if (raw < WQMAppSortOrderDefault || raw > WQMAppSortOrderSizeDescending) return WQMAppSortOrderDefault;
+    return (WQMAppSortOrder)raw;
+}
+
+static void WQMAppStoreSortOrder(WQMAppSortOrder order)
+{
+    [NSUserDefaults.standardUserDefaults setInteger:order forKey:kWQMAppSortOrderKey];
+}
+
+static BOOL WQMAppModelIsSystem(WQMAppModel *app)
+{
+    return [app.bundleIdentifier hasPrefix:@"com.apple."];
+}
+
+static WQMAppSizeFilter WQMAppSizeFilterForModel(WQMAppModel *app)
+{
+    if (!app.sizeKnown) return WQMAppSizeFilterUnknown;
+    if (app.dataSize >= kWQMAppSizeThresholdLarge) return WQMAppSizeFilterLarge;
+    if (app.dataSize >= kWQMAppSizeThresholdMedium) return WQMAppSizeFilterMedium;
+    return WQMAppSizeFilterSmall;
+}
+
+@interface WQMAppsSummaryView : UIView
+
+@property (nonatomic, strong) UILabel *totalLabel;
+@property (nonatomic, strong) UILabel *countLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UISearchBar *searchBar;
+
+- (void)setApps:(NSArray<WQMAppModel *> *)apps
+         status:(NSString *)status
+       scanning:(BOOL)scanning
+          stale:(BOOL)stale;
+
+@end
+
+@implementation WQMAppsSummaryView {
+    WQMSoftSurfaceView *_card;
+    BOOL _playedEntrance;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) {
+        _searchBar = [[UISearchBar alloc] init];
+        _searchBar.searchBarStyle = UISearchBarStyleMinimal;
+        _searchBar.placeholder = WQML(@"SEARCH_APPS", @"搜索 App");
+        _searchBar.translatesAutoresizingMaskIntoConstraints = NO;
+        _searchBar.searchTextField.backgroundColor = WQMTheme.surfaceColor;
+        _searchBar.searchTextField.layer.cornerRadius = 17;
+        _searchBar.searchTextField.layer.cornerCurve = kCACornerCurveContinuous;
+        _searchBar.searchTextField.clipsToBounds = YES;
+
+        _card = [[WQMSoftSurfaceView alloc] initWithElevated:YES];
+        _card.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UILabel *caption = [UILabel new];
+        caption.text = WQML(@"APP_TOTAL_COUNT", @"应用数量");
+        caption.font = [WQMTheme sectionTitleFont];
+        caption.textColor = WQMTheme.textSecondaryColor;
+
+        _totalLabel = [UILabel new];
+        _totalLabel.text = @"—";
+        _totalLabel.font = [WQMTheme displayNumberFont];
+        _totalLabel.textColor = WQMTheme.textPrimaryColor;
+        _totalLabel.adjustsFontForContentSizeCategory = YES;
+
+        _countLabel = [UILabel new];
+        _countLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+        _countLabel.textColor = WQMTheme.textSecondaryColor;
+        _countLabel.textAlignment = NSTextAlignmentRight;
+
+        _statusLabel = [UILabel new];
+        _statusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+        _statusLabel.textColor = WQMTheme.textSecondaryColor;
+        _statusLabel.numberOfLines = 2;
+
+        UIView *rule = [UIView new];
+        rule.backgroundColor = WQMTheme.separatorColor;
+        rule.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[caption, _countLabel]];
+        top.axis = UILayoutConstraintAxisHorizontal;
+        top.alignment = UIStackViewAlignmentCenter;
+        top.spacing = 12;
+
+        UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[top, _totalLabel, rule, _statusLabel]];
+        stack.axis = UILayoutConstraintAxisVertical;
+        stack.alignment = UIStackViewAlignmentFill;
+        stack.spacing = 9;
+        stack.translatesAutoresizingMaskIntoConstraints = NO;
+        [stack setCustomSpacing:3 afterView:top];
+        [stack setCustomSpacing:13 afterView:_totalLabel];
+        [_card addSubview:stack];
+        UIStackView *outer = [[UIStackView alloc] initWithArrangedSubviews:@[_searchBar, _card]];
+        outer.axis = UILayoutConstraintAxisVertical;
+        outer.spacing = 8;
+        outer.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:outer];
+
+        NSLayoutConstraint *headerFill = [outer.widthAnchor constraintEqualToAnchor:self.widthAnchor constant:-24];
+        headerFill.priority = 999;
+        [NSLayoutConstraint activateConstraints:@[
+            [_searchBar.heightAnchor constraintGreaterThanOrEqualToConstant:48],
+            [_statusLabel.heightAnchor constraintGreaterThanOrEqualToConstant:34],
+            [rule.heightAnchor constraintEqualToConstant:1],
+            [stack.topAnchor constraintEqualToAnchor:_card.topAnchor constant:20],
+            [stack.leadingAnchor constraintEqualToAnchor:_card.leadingAnchor constant:20],
+            [stack.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-20],
+            [stack.bottomAnchor constraintEqualToAnchor:_card.bottomAnchor constant:-18],
+            [outer.topAnchor constraintEqualToAnchor:self.topAnchor constant:6],
+            [outer.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [outer.widthAnchor constraintLessThanOrEqualToConstant:760],
+            headerFill,
+            [outer.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-8],
+        ]];
+    }
+    return self;
+}
+
+- (void)setApps:(NSArray<WQMAppModel *> *)apps
+         status:(NSString *)status
+       scanning:(BOOL)scanning
+          stale:(BOOL)stale
+{
+    unsigned long long total = 0;
+    NSUInteger known = 0;
+    for (WQMAppModel *app in apps) {
+        if (!app.sizeKnown) continue;
+        total += app.dataSize;
+        known++;
+    }
+    NSString *sizeText = @"—";
+    if (!scanning && known > 0) {
+        NSString *knownSize = WQMFormatBytes(total);
+        sizeText = known == apps.count
+            ? knownSize
+            : [NSString stringWithFormat:WQML(@"APP_TOTAL_PARTIAL_FORMAT", @"≥ %@"), knownSize];
+    }
+    [WQMTheme animateLabelChange:self.totalLabel update:^{
+        self.totalLabel.text = scanning && apps.count == 0
+            ? @"—"
+            : [NSString stringWithFormat:@"%lu", (unsigned long)apps.count];
+    }];
+    [WQMTheme animateLabelChange:self.countLabel update:^{
+        self.countLabel.text = scanning
+            ? WQML(@"SCANNING", @"扫描中")
+            : (known > 0 ? sizeText : WQML(@"APP_SIZE_UNKNOWN_SHORT", @"容量未知"));
+    }];
+    [WQMTheme animateLabelChange:self.statusLabel update:^{
+        NSString *line = status ?: @"";
+        if (stale && line.length) {
+            line = [NSString stringWithFormat:WQML(@"APP_INDEX_STALE_HINT_FORMAT", @"%@ · 下拉可重试"), line];
+        }
+        self.statusLabel.text = line;
+        // 索引过期要让用户一眼看到（warningColor 与次要文字同色，这里改用危险色）。
+        self.statusLabel.textColor = stale ? WQMTheme.dangerColor : WQMTheme.textSecondaryColor;
+    }];
+    if (!_playedEntrance) {
+        _playedEntrance = YES;
+        [WQMTheme animateEntrance:_card delay:0.02];
+    }
+}
+
+@end
+
+@interface WQMAppCardCell : UITableViewCell
+
+@property (nonatomic, strong) WQMSoftSurfaceView *cardView;
+@property (nonatomic, strong) UIListContentView *listContentView;
+
+- (void)configureWithApp:(WQMAppModel *)app;
+- (void)configureEmptyScanning:(BOOL)scanning status:(NSString *)status;
+- (void)configureEmptyFiltered;
+- (void)playEntranceWithDelay:(NSTimeInterval)delay;
+
+@end
+
+@implementation WQMAppCardCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier
+{
+    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
+    if (self) {
+        self.backgroundColor = UIColor.clearColor;
+        self.contentView.backgroundColor = UIColor.clearColor;
+        self.clipsToBounds = NO;
+        self.contentView.clipsToBounds = NO;
+        self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        _cardView = [[WQMSoftSurfaceView alloc] initWithElevated:NO];
+        _cardView.layer.cornerRadius = 22;
+        _cardView.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UIListContentConfiguration *configuration = [UIListContentConfiguration subtitleCellConfiguration];
+        configuration.imageProperties.maximumSize = CGSizeMake(32, 32);
+        configuration.imageProperties.cornerRadius = 10;
+        configuration.imageProperties.reservedLayoutSize = CGSizeMake(32, 32);
+        configuration.textProperties.numberOfLines = 2;
+        configuration.textToSecondaryTextVerticalPadding = 2;
+        _listContentView = [[UIListContentView alloc] initWithConfiguration:configuration];
+        _listContentView.translatesAutoresizingMaskIntoConstraints = NO;
+        _listContentView.directionalLayoutMargins = NSDirectionalEdgeInsetsZero;
+        [_cardView addSubview:_listContentView];
+        [self.contentView addSubview:_cardView];
+        NSLayoutConstraint *cardFill = [_cardView.widthAnchor constraintEqualToAnchor:self.contentView.widthAnchor
+                                                                             constant:-24];
+        cardFill.priority = 999;
+        [NSLayoutConstraint activateConstraints:@[
+            [_cardView.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:5],
+            [_cardView.centerXAnchor constraintEqualToAnchor:self.contentView.centerXAnchor],
+            [_cardView.widthAnchor constraintLessThanOrEqualToConstant:760],
+            cardFill,
+            [_cardView.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-5],
+            [_listContentView.topAnchor constraintEqualToAnchor:_cardView.topAnchor constant:8],
+            [_listContentView.leadingAnchor constraintEqualToAnchor:_cardView.leadingAnchor constant:14],
+            [_listContentView.trailingAnchor constraintEqualToAnchor:_cardView.trailingAnchor constant:-14],
+            [_listContentView.bottomAnchor constraintEqualToAnchor:_cardView.bottomAnchor constant:-8],
+            [_cardView.heightAnchor constraintGreaterThanOrEqualToConstant:64],
+        ]];
+    }
+    return self;
+}
+
+- (void)configureWithApp:(WQMAppModel *)app
+{
+    UIListContentConfiguration *configuration = (UIListContentConfiguration *)self.listContentView.configuration;
+    configuration.attributedText = nil;
+    configuration.text = app.displayName ?: app.bundleIdentifier ?: WQML(@"UNKNOWN_APP", @"未知 App");
+    configuration.secondaryText = [NSString stringWithFormat:@"%@  ·  %@",
+                                   app.bundleIdentifier.length
+                                       ? app.bundleIdentifier
+                                       : WQML(@"NO_BUNDLE_ID", @"无 Bundle ID"),
+                                   app.formattedSize];
+    configuration.textProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    configuration.textProperties.color = WQMTheme.textPrimaryColor;
+    configuration.secondaryTextProperties.font =
+        [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    configuration.secondaryTextProperties.color = WQMTheme.textSecondaryColor;
+    configuration.secondaryTextProperties.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    configuration.image = [WQMAppIconService iconForBundleIdentifier:app.bundleIdentifier
+                                                         displayName:app.displayName];
+    self.listContentView.configuration = configuration;
+    self.accessibilityIdentifier = [@"app." stringByAppendingString:app.bundleIdentifier ?: @"unknown"];
+    self.accessibilityLabel = [NSString stringWithFormat:@"%@，%@", app.displayName, app.statusText];
+}
+
+- (void)refreshIconWithApp:(WQMAppModel *)app
+{
+    UIListContentConfiguration *configuration =
+        (UIListContentConfiguration *)self.listContentView.configuration;
+    configuration.image = [WQMAppIconService iconForBundleIdentifier:app.bundleIdentifier
+                                                         displayName:app.displayName];
+    self.listContentView.configuration = configuration;
+}
+
+- (void)configureEmptyScanning:(BOOL)scanning status:(NSString *)status
+{
+    UIListContentConfiguration *configuration = (UIListContentConfiguration *)self.listContentView.configuration;
+    configuration.attributedText = nil;
+    configuration.text = scanning
+        ? WQML(@"SCANNING_APPS", @"正在扫描")
+        : WQML(@"NO_APPS_FOUND", @"未找到 App");
+    configuration.secondaryText = status.length
+        ? status
+        : WQML(@"APPS_EMPTY_HINT", @"下拉刷新或检查 App Group");
+    configuration.textProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    configuration.textProperties.color = WQMTheme.textPrimaryColor;
+    configuration.secondaryTextProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    configuration.secondaryTextProperties.color = WQMTheme.textSecondaryColor;
+    configuration.image = scanning
+        ? [UIImage imageNamed:@"Scan"]
+        : [UIImage systemImageNamed:@"rectangle.dashed"];
+    configuration.imageProperties.tintColor = WQMTheme.textSecondaryColor;
+    self.listContentView.configuration = configuration;
+    self.accessibilityIdentifier = scanning ? @"apps.loading" : @"apps.empty";
+    self.accessibilityLabel = scanning
+        ? WQML(@"SCANNING_APPS_A11Y", @"正在扫描应用")
+        : WQML(@"NO_APPS_FOUND_A11Y", @"未找到应用");
+}
+
+- (void)configureEmptyFiltered
+{
+    UIListContentConfiguration *configuration = (UIListContentConfiguration *)self.listContentView.configuration;
+    configuration.attributedText = nil;
+    configuration.text = WQML(@"APP_NO_MATCH", @"没有符合筛选的 App");
+    configuration.secondaryText = WQML(@"APP_ADJUST_FILTER", @"调整搜索或筛选条件");
+    configuration.textProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    configuration.textProperties.color = WQMTheme.textPrimaryColor;
+    configuration.secondaryTextProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    configuration.secondaryTextProperties.color = WQMTheme.textSecondaryColor;
+    configuration.image = [UIImage systemImageNamed:@"line.3.horizontal.decrease.circle"];
+    configuration.imageProperties.tintColor = WQMTheme.textSecondaryColor;
+    self.listContentView.configuration = configuration;
+    self.accessibilityIdentifier = @"apps.empty.filtered";
+    self.accessibilityLabel = WQML(@"APP_NO_MATCH", @"没有符合筛选的 App");
+}
+
+- (void)playEntranceWithDelay:(NSTimeInterval)delay
+{
+    [WQMTheme animateEntrance:self.cardView delay:delay];
+}
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated
+{
+    [super setHighlighted:highlighted animated:animated];
+    [WQMTheme animatePress:self.cardView pressed:highlighted];
+}
+
+@end
+
+@interface WQMAppsViewController () <UIAdaptivePresentationControllerDelegate>
+@property (nonatomic, strong, nullable) UIVisualEffectView *sheetBlurView;
+@end
+
+@implementation WQMAppsViewController {
+    NSArray<WQMAppModel *> *_apps;
+    NSArray<WQMAppModel *> *_visibleApps;
+    NSString *_query;
+    NSString *_status;
+    BOOL _statusStale;
+    WQScanCancellation *_scanCancellation;
+    WQMBackupQueueViewController *_batchController;
+    NSUInteger _scanGeneration;
+    BOOL _scanning;
+    WQMConfirmationGate *_restoreGate;
+    WQMAppsSummaryView *_summaryView;
+    NSMutableSet<NSString *> *_animatedApps;
+    NSDate *_cacheLoadedAt;
+    BOOL _presentedFixtureActions;
+    BOOL _pushedFixtureLens;
+    BOOL _pendingDataReload;
+    WQMAppSizeFilter _sizeFilter;
+    WQMAppSourceFilter _sourceFilter;
+    WQMAppSortOrder _sortOrder;
+}
+
+- (instancetype)init
+{
+    self = [super initWithStyle:UITableViewStylePlain];
+    if (self) {
+        _sizeFilter = WQMAppStoredSizeFilter();
+        _sourceFilter = WQMAppStoredSourceFilter();
+        _sortOrder = WQMAppStoredSortOrder();
+    }
+    return self;
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.title = WQML(@"TAB_APPS", @"应用");
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
+    self.navigationController.navigationBar.prefersLargeTitles = YES;
+    [self updateFilterButtons];
+    self.tableView.accessibilityIdentifier = @"apps.table";
+    self.tableView.backgroundColor = WQMTheme.canvasColor;
+    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 68;
+    self.tableView.cellLayoutMarginsFollowReadableWidth = YES;
+    self.tableView.contentInset = UIEdgeInsetsMake(4, 0, 24, 0);
+    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    self.definesPresentationContext = YES;
+    _animatedApps = [NSMutableSet new];
+
+    _summaryView = [[WQMAppsSummaryView alloc] initWithFrame:CGRectMake(0, 0, self.tableView.bounds.size.width, 146)];
+    _summaryView.searchBar.delegate = self;
+    self.tableView.tableHeaderView = _summaryView;
+    [_summaryView setApps:@[] status:WQML(@"PREPARING_SCAN", @"准备扫描") scanning:YES stale:NO];
+    UITapGestureRecognizer *dismissTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissKeyboard:)];
+    dismissTap.cancelsTouchesInView = NO;
+    dismissTap.delegate = self;
+    [self.tableView addGestureRecognizer:dismissTap];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(appIconDidResolve:)
+                                               name:WQMAppIconDidResolveNotification
+                                             object:nil];
+
+    self.refreshControl = [UIRefreshControl new];
+    [self.refreshControl addTarget:self action:@selector(refreshApps) forControlEvents:UIControlEventValueChanged];
+    [self loadInitialIndex];
+}
+
+- (void)dealloc
+{
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [WQMAppIconService cancelPendingRequests];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    if (_scanning && _scanCancellation.isCancelled) [self scan];
+    if (!_scanning && _cacheLoadedAt &&
+        -[_cacheLoadedAt timeIntervalSinceNow] > 30 * 60) {
+        [self scan];
+    }
+}
+
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+#if DEBUG
+    if (!_presentedFixtureActions &&
+        [NSProcessInfo.processInfo.environment[@"WQM_UI_ACTION_PANEL"] boolValue] &&
+        _visibleApps.count) {
+        _presentedFixtureActions = YES;
+        [self presentActionsForApp:_visibleApps.firstObject];
+    }
+    [self presentFixtureLensIfNeeded];
+#endif
+}
+
+- (void)presentFixtureLensIfNeeded
+{
+#if DEBUG
+    if (_pushedFixtureLens || !_visibleApps.count) return;
+    NSString *feature = NSProcessInfo.processInfo.environment[@"WQM_UI_FEATURE"];
+    if (![NSProcessInfo.processInfo.environment[@"WQM_UI_LENS"] boolValue] && !feature.length) return;
+    _pushedFixtureLens = YES;
+    WQMAppModel *app = _visibleApps.firstObject;
+    NSString *wanted = NSProcessInfo.processInfo.environment[@"WQM_UI_LENS_APP"];
+    if (wanted.length) {
+        for (WQMAppModel *candidate in _visibleApps) {
+            if ([candidate.bundleIdentifier isEqualToString:wanted]) { app = candidate; break; }
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if ([@[@"sqlite", @"plist", @"text", @"image"] containsObject:feature]) {
+            NSDictionary *names = @{@"sqlite":@"inspection.sqlite", @"plist":@"inspection.plist", @"text":@"large.txt", @"image":@"large.png"};
+            NSString *path = [[app.containerPath stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:names[feature]];
+            [self.navigationController pushViewController:[[WQMFilePreviewViewController alloc] initWithFilePath:path name:nil] animated:NO];
+        }
+        else if ([feature isEqual:@"diagnostics"]) [self.navigationController pushViewController:[[WQMAccessViewController alloc] initWithApp:app] animated:NO];
+        else if ([feature isEqual:@"history"]) [self showStorageChanges];
+        else if ([feature isEqual:@"trend"]) [self.navigationController pushViewController:[[WQMStorageChangesViewController alloc] initWithApp:app] animated:NO];
+        else if ([feature isEqual:@"batch"]) [self showBackupQueue];
+        else if ([feature isEqual:@"files"]) [self.navigationController pushViewController:[[WQMFilesViewController alloc] initWithApp:app] animated:NO];
+        else if ([feature isEqual:@"export"]) [self.navigationController pushViewController:[[WQMExportCenterViewController alloc] initWithApp:app] animated:NO];
+        else if ([feature isEqual:@"audit"]) [self showFileAudit];
+        else if ([feature isEqual:@"search"]) [self showGlobalSearch];
+        else if ([feature isEqual:@"selection"]) [self.navigationController pushViewController:[[WQMBackupSelectionViewController alloc] initWithApp:app completion:^(WQMBackupScopeDescriptor *selection) {}] animated:NO];
+        else if ([feature isEqual:@"backup"] || [feature isEqual:@"compare"]) {
+            NSArray *records = [WQMBackupStore allBackups];
+            WQMBackupRecord *first = records.firstObject, *second = nil;
+            for (WQMBackupRecord *record in records) if (![record.path isEqual:first.path] && [record.bundleIdentifier isEqual:first.bundleIdentifier] && [record.requestedParts isEqual:first.requestedParts]) { second = record; break; }
+            if (first) [self.navigationController pushViewController:second && [feature isEqual:@"compare"] ? [[WQMFilesViewController alloc] initComparingOlder:second newer:first] : [[WQMFilesViewController alloc] initWithBackup:first] animated:NO];
+        } else [self showSpaceLensForApp:app];
+    });
+#endif
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    [self dismissSearchKeyboard];
+    [WQMAppIconService cancelPendingRequests];
+    _pendingDataReload = NO;
+    if (_scanning) [_scanCancellation cancel];
+}
+
+- (void)dismissKeyboard:(__unused UITapGestureRecognizer *)gesture
+{
+    [self dismissSearchKeyboard];
+}
+
+- (void)dismissSearchKeyboard
+{
+    [self.view endEditing:YES];
+    [_summaryView.searchBar resignFirstResponder];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+       shouldReceiveTouch:(UITouch *)touch
+{
+    if (gestureRecognizer.view == self.tableView &&
+        [touch.view isDescendantOfView:_summaryView.searchBar]) {
+        return NO;
+    }
+    return YES;
+}
+
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText
+{
+    [WQMAppIconService cancelPendingRequests];
+    _query = [searchText stringByTrimmingCharactersInSet:
+              NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    [self rebuildVisibleApps];
+    [_animatedApps removeAllObjects];
+    _pendingDataReload = NO;
+    [self.tableView reloadData];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar
+{
+    [self dismissSearchKeyboard];
+}
+
+- (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar
+{
+    [searchBar setShowsCancelButton:YES animated:YES];
+}
+
+- (void)searchBarTextDidEndEditing:(UISearchBar *)searchBar
+{
+    [searchBar setShowsCancelButton:NO animated:NO];
+}
+
+- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar
+{
+    [WQMAppIconService cancelPendingRequests];
+    searchBar.text = @"";
+    _query = nil;
+    [self rebuildVisibleApps];
+    [self dismissSearchKeyboard];
+    _pendingDataReload = NO;
+    [self.tableView reloadData];
+}
+
+- (void)refreshApps
+{
+    [WQMAppIconService clearCache];
+    wq_enumerate_invalidate();
+    wq_display_names_reset_miss();
+    [self scan];
+}
+
+- (void)loadInitialIndex
+{
+#if DEBUG
+    if ([NSProcessInfo.processInfo.environment[@"WQM_UI_FIXTURES"] boolValue]) {
+        [self scan];
+        return;
+    }
+    if ([NSProcessInfo.processInfo.environment[@"WQM_UI_FORCE_SCAN"] boolValue]) {
+        [self scan];
+        return;
+    }
+#endif
+    WQMAppCacheSnapshot *cache = [WQMAppCache load];
+    if (cache.apps.count) {
+        _apps = cache.apps;
+        _cacheLoadedAt = cache.updatedAt;
+        _scanning = NO;
+        _status = [self cacheStatusForDate:cache.updatedAt];
+        if (cache.limitedCount > 0) {
+            _status = [NSString stringWithFormat:
+                       WQML(@"APP_INDEX_LIMITED_SUFFIX", @"%@ · %lu 个受限"),
+                       _status, (unsigned long)cache.limitedCount];
+        }
+        _statusStale = NO;
+        [self rebuildVisibleApps];
+        [self updateSummary];
+        [self.tableView reloadData];
+
+        NSTimeInterval age = -[cache.updatedAt timeIntervalSinceNow];
+        if (age < 30 * 60) return;
+        [self scan];
+        return;
+    }
+    [self scan];
+}
+
+- (NSString *)cacheStatusForDate:(NSDate *)date
+{
+    NSTimeInterval age = MAX(0, -[date timeIntervalSinceNow]);
+    NSString *relative;
+    if (age < 60) relative = WQML(@"TIME_JUST_NOW", @"刚刚");
+    else if (age < 3600) relative = [NSString stringWithFormat:
+                                     WQML(@"TIME_MINUTES_AGO", @"%ld 分钟前"), (long)(age / 60)];
+    else if (age < 86400) relative = [NSString stringWithFormat:
+                                      WQML(@"TIME_HOURS_AGO", @"%ld 小时前"), (long)(age / 3600)];
+    else relative = [NSString stringWithFormat:
+                     WQML(@"TIME_DAYS_AGO", @"%ld 天前"), (long)(age / 86400)];
+    return [NSString stringWithFormat:WQML(@"APP_INDEX_UPDATED", @"App 索引 · %@更新"), relative];
+}
+
+- (void)scan
+{
+    if (_scanning) { [self.refreshControl endRefreshing]; return; }
+    WQScanCancellation *gateCancellation = [WQScanCancellation new];
+    if (![WQMLongOperationBanner startOperationWithTitle:WQML(@"SCANNING_APPS", @"正在查找 App…") status:nil cancelHandler:^{ [gateCancellation cancel]; }]) { [self.refreshControl endRefreshing]; return; }
+    [_scanCancellation cancel];
+    WQScanCancellation *cancellation = gateCancellation;
+    NSArray *previousApps = _apps;
+    _scanCancellation = cancellation;
+    NSUInteger generation = ++_scanGeneration;
+    _scanning = YES;
+    [WQMAppIconService cancelPendingRequests];
+    _status = _apps.count
+        ? WQML(@"APP_INDEX_REFRESHING", @"正在后台更新 App 索引…")
+        : WQML(@"SCANNING_APPS", @"正在查找 App…");
+    _statusStale = NO;
+    [_animatedApps removeAllObjects];
+    [_summaryView setApps:_apps status:_status scanning:YES stale:NO];
+    [self.refreshControl beginRefreshing];
+    if (!_apps.count) [self.tableView reloadData];
+
+    WQMAppScanner *scanner = [WQMAppScanner new];
+    __weak typeof(self) weakSelf = self;
+    [scanner scanWithCancellation:cancellation progress:^(NSString *status) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || generation != self->_scanGeneration || cancellation.isCancelled) return;
+        self->_status = status;
+        self->_statusStale = NO;
+        [self updateSummary];
+        [WQMLongOperationBanner.shared updateStatus:status];
+    } partial:^(NSArray<WQMAppModel *> *apps) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || generation != self->_scanGeneration || cancellation.cancelled) return;
+        self->_apps = apps;
+        [self rebuildVisibleApps]; [self updateSummary]; [self reloadAppListForDataChange];
+    } completion:^(WQMAppScanResult *result) {
+        [WQMLongOperationBanner.shared hide];
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || generation != self->_scanGeneration) return;
+        if (result.cancelled) self->_apps = previousApps;
+        self->_scanning = NO;
+        self->_scanCancellation = nil;
+        if (result.apps.count && !result.cancelled) {
+            self->_apps = result.apps;
+            self->_status = result.status;
+            self->_statusStale = NO;
+            self->_cacheLoadedAt = NSDate.date;
+            [self->_animatedApps removeAllObjects];
+            dispatch_async(WQMIndexSaveQueue(), ^{ [WQMAppCache saveResult:result]; });
+        } else if (self->_apps.count) {
+            self->_status = result.cancelled
+                ? WQML(@"APP_INDEX_UPDATE_CANCELLED", @"更新已取消，继续显示缓存索引")
+                : WQML(@"APP_INDEX_REFRESH_FAILED", @"刷新失败，继续显示上次索引");
+            self->_statusStale = YES;
+        } else {
+            self->_apps = @[];
+            self->_status = result.status;
+            self->_statusStale = NO;
+        }
+        [self rebuildVisibleApps];
+        [self updateSummary];
+        [self.refreshControl endRefreshing];
+        [self reloadAppListForDataChange];
+#if DEBUG
+        if (!self->_presentedFixtureActions &&
+            [NSProcessInfo.processInfo.environment[@"WQM_UI_ACTION_PANEL"] boolValue] &&
+            self->_visibleApps.count) {
+            self->_presentedFixtureActions = YES;
+            WQMAppModel *fixture = self->_visibleApps.firstObject;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self presentActionsForApp:fixture];
+            });
+        }
+        [self presentFixtureLensIfNeeded];
+#endif
+    }];
+}
+
+- (void)appIconDidResolve:(NSNotification *)notification
+{
+    NSString *bundleIdentifier = notification.userInfo[WQMAppIconBundleIdentifierKey];
+    if (!bundleIdentifier.length) return;
+    NSUInteger index = [_visibleApps indexOfObjectPassingTest:
+        ^BOOL(WQMAppModel *app, NSUInteger __unused idx, BOOL *__unused stop) {
+            return [app.bundleIdentifier isEqualToString:bundleIdentifier];
+        }];
+    if (index == NSNotFound || index >= (NSUInteger)[self.tableView numberOfRowsInSection:0]) return;
+    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:(NSInteger)index inSection:0];
+    WQMAppCardCell *cell = (WQMAppCardCell *)[self.tableView cellForRowAtIndexPath:indexPath];
+    if (cell) [cell refreshIconWithApp:_visibleApps[index]];
+}
+
+- (void)reloadAppListForDataChange
+{
+    if (self.tableView.isTracking || self.tableView.isDragging || self.tableView.isDecelerating) {
+        _pendingDataReload = YES;
+        return;
+    }
+    [self.tableView reloadData];
+}
+
+- (void)flushDeferredListUpdates
+{
+    if (_pendingDataReload) {
+        _pendingDataReload = NO;
+        [self.tableView reloadData];
+    }
+}
+
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate
+{
+    if (!decelerate) [self flushDeferredListUpdates];
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView
+{
+    [self flushDeferredListUpdates];
+}
+
+- (void)updateSummary
+{
+    [_summaryView setApps:_apps status:_status scanning:_scanning stale:_statusStale];
+}
+
+- (void)updateFilterButtons
+{
+    NSString *sizeTitle = _sizeFilter == WQMAppSizeFilterAll ? WQML(@"APP_FILTER_SIZE", @"大小")
+        : _sizeFilter == WQMAppSizeFilterLarge ? WQML(@"APP_SIZE_LARGE", @"大型")
+        : _sizeFilter == WQMAppSizeFilterMedium ? WQML(@"APP_SIZE_MEDIUM", @"中型")
+        : _sizeFilter == WQMAppSizeFilterSmall ? WQML(@"APP_SIZE_SMALL", @"小型")
+        : WQML(@"APP_SIZE_UNKNOWN", @"未知");
+    UIMenu *sizeMenu = [UIMenu menuWithChildren:@[
+        [self appSizeAction:WQMAppSizeFilterAll title:WQML(@"APP_FILTER_ALL", @"全部") symbol:@"circle.grid.2x2"],
+        [self appSizeAction:WQMAppSizeFilterLarge title:WQML(@"APP_SIZE_LARGE", @"大型") symbol:@"arrow.up.circle"],
+        [self appSizeAction:WQMAppSizeFilterMedium title:WQML(@"APP_SIZE_MEDIUM", @"中型") symbol:@"circle"],
+        [self appSizeAction:WQMAppSizeFilterSmall title:WQML(@"APP_SIZE_SMALL", @"小型") symbol:@"arrow.down.circle"],
+        [self appSizeAction:WQMAppSizeFilterUnknown title:WQML(@"APP_SIZE_UNKNOWN", @"未知") symbol:@"questionmark.circle"],
+    ]];
+
+    NSString *sourceTitle = _sourceFilter == WQMAppSourceFilterAll ? WQML(@"APP_FILTER_SOURCE", @"来源")
+        : _sourceFilter == WQMAppSourceFilterSystem ? WQML(@"APP_SOURCE_SYSTEM", @"系统")
+        : WQML(@"APP_SOURCE_THIRD_PARTY", @"第三方");
+    UIMenu *sourceMenu = [UIMenu menuWithChildren:@[
+        [self appSourceAction:WQMAppSourceFilterAll title:WQML(@"APP_FILTER_ALL", @"全部") symbol:@"tray.full"],
+        [self appSourceAction:WQMAppSourceFilterSystem title:WQML(@"APP_SOURCE_SYSTEM", @"系统") symbol:@"apple.logo"],
+        [self appSourceAction:WQMAppSourceFilterThirdParty title:WQML(@"APP_SOURCE_THIRD_PARTY", @"第三方") symbol:@"square.grid.2x2"],
+    ]];
+
+    NSString *sortTitle = _sortOrder == WQMAppSortOrderName ? WQML(@"APP_SORT_NAME", @"名称")
+        : _sortOrder == WQMAppSortOrderSizeDescending ? WQML(@"APP_SORT_SIZE", @"大小")
+        : WQML(@"APP_SORT", @"排序");
+    UIMenu *sortMenu = [UIMenu menuWithChildren:@[
+        [self appSortAction:WQMAppSortOrderDefault title:WQML(@"APP_SORT_DEFAULT", @"扫描顺序") symbol:@"arrow.clockwise"],
+        [self appSortAction:WQMAppSortOrderName title:WQML(@"APP_SORT_NAME", @"名称") symbol:@"textformat.abc"],
+        [self appSortAction:WQMAppSortOrderSizeDescending title:WQML(@"APP_SORT_SIZE", @"大小") symbol:@"internaldrive"],
+    ]];
+
+    UIButton *sizeButton = [self menuBarButtonWithTitle:sizeTitle
+                                                   menu:sizeMenu
+                                             identifier:@"apps.filter.size"
+                                                  label:WQML(@"APP_FILTER_SIZE", @"大小")];
+    UIButton *sourceButton = [self menuBarButtonWithTitle:sourceTitle
+                                                     menu:sourceMenu
+                                               identifier:@"apps.filter.source"
+                                                    label:WQML(@"APP_FILTER_SOURCE", @"来源")];
+    UIButton *sortButton = [self menuBarButtonWithTitle:sortTitle
+                                                   menu:sortMenu
+                                             identifier:@"apps.sort"
+                                                  label:WQML(@"APP_SORT", @"排序")];
+
+    UIStackView *group = [[UIStackView alloc] initWithArrangedSubviews:@[sizeButton, sourceButton, sortButton]];
+    group.axis = UILayoutConstraintAxisHorizontal;
+    group.alignment = UIStackViewAlignmentCenter;
+    group.spacing = 14;
+    self.navigationItem.rightBarButtonItems = @[[[UIBarButtonItem alloc] initWithCustomView:group]];
+    __weak typeof(self) weakSelf = self;
+    UIMenu *tools = [UIMenu menuWithChildren:@[
+        [UIAction actionWithTitle:WQML(@"SPACE_CHANGES", @"空间变化") image:[UIImage systemImageNamed:@"chart.line.uptrend.xyaxis"] identifier:nil handler:^(UIAction *action) { [weakSelf showStorageChanges]; }],
+        [UIAction actionWithTitle:WQML(@"BATCH_BACKUP", @"批量备份") image:[UIImage systemImageNamed:@"square.stack.3d.up"] identifier:nil handler:^(UIAction *action) { [weakSelf showBackupQueue]; }],
+        [UIAction actionWithTitle:WQML(@"AUDIT_TOOL_TITLE", @"大文件与重复文件") image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *action) { [weakSelf showFileAudit]; }],
+        [UIAction actionWithTitle:WQML(@"GLOBAL_SEARCH_TITLE", @"全局文件搜索") image:[UIImage systemImageNamed:@"magnifyingglass"] identifier:nil handler:^(UIAction *action) { [weakSelf showGlobalSearch]; }],
+    ]];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"] menu:tools];
+    self.navigationItem.leftBarButtonItem.accessibilityLabel = WQML(@"APP_TOOLS", @"应用工具");
+}
+
+/// Compact bar button for the filter and sort menus: text only at 12 pt, because
+/// three of them share the navigation bar. The title carries the current value.
+- (UIButton *)menuBarButtonWithTitle:(NSString *)title
+                                menu:(UIMenu *)menu
+                          identifier:(NSString *)identifier
+                               label:(NSString *)label
+{
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:title forState:UIControlStateNormal];
+    UIFont *base = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    button.titleLabel.font = [UIFontMetrics.defaultMetrics scaledFontForFont:base];
+    button.titleLabel.adjustsFontForContentSizeCategory = YES;
+    button.menu = menu;
+    button.showsMenuAsPrimaryAction = YES;
+    button.accessibilityIdentifier = identifier;
+    button.accessibilityLabel = label;
+    button.accessibilityValue = title;
+    return button;
+}
+
+- (UIAction *)appSizeAction:(WQMAppSizeFilter)filter title:(NSString *)title symbol:(NSString *)symbol
+{
+    __weak typeof(self) weakSelf = self;
+    UIAction *action = [UIAction actionWithTitle:title image:[UIImage systemImageNamed:symbol]
+                                      identifier:nil handler:^(__unused UIAction *action) {
+        __strong typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_sizeFilter = filter;
+        WQMAppStoreSizeFilter(filter);
+        [self updateFilterButtons];
+        [self rebuildVisibleApps];
+        [self.tableView reloadData];
+    }];
+    action.state = filter == _sizeFilter ? UIMenuElementStateOn : UIMenuElementStateOff;
+    return action;
+}
+
+- (UIAction *)appSourceAction:(WQMAppSourceFilter)filter title:(NSString *)title symbol:(NSString *)symbol
+{
+    __weak typeof(self) weakSelf = self;
+    UIAction *action = [UIAction actionWithTitle:title image:[UIImage systemImageNamed:symbol]
+                                      identifier:nil handler:^(__unused UIAction *action) {
+        __strong typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_sourceFilter = filter;
+        WQMAppStoreSourceFilter(filter);
+        [self updateFilterButtons];
+        [self rebuildVisibleApps];
+        [self.tableView reloadData];
+    }];
+    action.state = filter == _sourceFilter ? UIMenuElementStateOn : UIMenuElementStateOff;
+    return action;
+}
+
+- (UIAction *)appSortAction:(WQMAppSortOrder)order title:(NSString *)title symbol:(NSString *)symbol
+{
+    __weak typeof(self) weakSelf = self;
+    UIAction *action = [UIAction actionWithTitle:title image:[UIImage systemImageNamed:symbol]
+                                      identifier:nil handler:^(__unused UIAction *action) {
+        __strong typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_sortOrder = order;
+        WQMAppStoreSortOrder(order);
+        [self updateFilterButtons];
+        [self rebuildVisibleApps];
+        [self.tableView reloadData];
+    }];
+    action.state = order == _sortOrder ? UIMenuElementStateOn : UIMenuElementStateOff;
+    return action;
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    CGSize fitting = [_summaryView systemLayoutSizeFittingSize:
+                      CGSizeMake(self.tableView.bounds.size.width, UILayoutFittingCompressedSize.height)
+                                        withHorizontalFittingPriority:UILayoutPriorityRequired
+                                              verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
+    if (fabs(self.tableView.tableHeaderView.frame.size.height - fitting.height) > 0.5) {
+        UIView *header = self.tableView.tableHeaderView;
+        CGRect frame = header.frame;
+        frame.size.width = self.tableView.bounds.size.width;
+        frame.size.height = fitting.height;
+        header.frame = frame;
+        self.tableView.tableHeaderView = header;
+    }
+}
+
+- (void)rebuildVisibleApps
+{
+    BOOL hasQuery = _query.length > 0;
+    BOOL hasSizeFilter = _sizeFilter != WQMAppSizeFilterAll;
+    BOOL hasSourceFilter = _sourceFilter != WQMAppSourceFilterAll;
+    NSArray<WQMAppModel *> *visible = _apps;
+    if (hasQuery || hasSizeFilter || hasSourceFilter) {
+        visible = [_apps filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:
+            ^BOOL(WQMAppModel *app, NSDictionary *__unused bindings) {
+                if (hasQuery) {
+                    NSString *query = self->_query;
+                    BOOL matches = [app.displayName localizedCaseInsensitiveContainsString:query] ||
+                                   [app.bundleIdentifier localizedCaseInsensitiveContainsString:query] ||
+                                   [app.searchInitials containsString:query.lowercaseString];
+                    if (!matches) return NO;
+                }
+                if (hasSizeFilter && WQMAppSizeFilterForModel(app) != self->_sizeFilter) return NO;
+                if (hasSourceFilter) {
+                    BOOL isSystem = WQMAppModelIsSystem(app);
+                    if (self->_sourceFilter == WQMAppSourceFilterSystem) {
+                        if (!isSystem) return NO;
+                    } else if (app.bundleIdentifier.length == 0 || isSystem) {
+                        return NO;
+                    }
+                }
+                return YES;
+            }]];
+    }
+    _visibleApps = [WQMAppModel apps:visible sortedByOrder:_sortOrder];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+    if (!_visibleApps.count) return 1;
+    return _visibleApps.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
+{
+    BOOL filtering = _query.length || _sizeFilter != WQMAppSizeFilterAll || _sourceFilter != WQMAppSourceFilterAll;
+    if (filtering && _apps.count) {
+        return [NSString stringWithFormat:WQML(@"APP_SEARCH_COUNT", @"%lu / %lu 个 App"),
+                (unsigned long)_visibleApps.count, (unsigned long)_apps.count];
+    }
+    return WQML(@"APP_LIST", @"应用列表");
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
+{
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    WQMAppCardCell *cell = [tableView dequeueReusableCellWithIdentifier:@"app"];
+    if (!cell) {
+        cell = [[WQMAppCardCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"app"];
+    }
+
+    if (!_visibleApps.count) {
+        if (_apps.count) [cell configureEmptyFiltered];
+        else [cell configureEmptyScanning:_scanning status:_status];
+        return cell;
+    }
+
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)_visibleApps.count) return cell;
+    WQMAppModel *app = _visibleApps[(NSUInteger)indexPath.row];
+    [cell configureWithApp:app];
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    if (![cell isKindOfClass:WQMAppCardCell.class] || indexPath.row >= (NSInteger)_visibleApps.count ||
+        !_animatedApps) return;
+    WQMAppModel *app = _visibleApps[(NSUInteger)indexPath.row];
+    [WQMAppIconService requestIconForBundleIdentifier:app.bundleIdentifier
+                                          displayName:app.displayName];
+    NSString *key = app.bundleIdentifier.length ? app.bundleIdentifier : app.containerPath;
+    if ([_animatedApps containsObject:key]) return;
+    [_animatedApps addObject:key];
+    if (self.tableView.isTracking || self.tableView.isDragging || self.tableView.isDecelerating ||
+        indexPath.row >= 8) {
+        return;
+    }
+    NSTimeInterval delay = MIN(indexPath.row, 6) * 0.025;
+    [(WQMAppCardCell *)cell playEntranceWithDelay:delay];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.row >= (NSInteger)_visibleApps.count) return;
+    [self dismissSearchKeyboard];
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
+    WQMAppModel *app = _visibleApps[(NSUInteger)indexPath.row];
+    [self presentActionsForApp:app];
+}
+
+- (void)presentActionsForApp:(WQMAppModel *)app
+{
+    [self dismissSearchKeyboard];
+    [self installSheetBlur];
+    WQMAppActionsViewController *actions = [[WQMAppActionsViewController alloc] initWithApp:app];
+    actions.actionHandler = ^(WQMAppAction action) {
+        [self removeSheetBlur];
+        if (action == WQMAppActionDiagnose) {
+            [self.navigationController pushViewController:[[WQMAccessViewController alloc] initWithApp:app] animated:YES]; return;
+        }
+        if (action == WQMAppActionRefresh) { [self refreshApp:app]; return; }
+        if (action == WQMAppActionCopyBundleID) {
+            if (!app.bundleIdentifier.length) return;
+            UIPasteboard.generalPasteboard.string = app.bundleIdentifier;
+            UINotificationFeedbackGenerator *done = [UINotificationFeedbackGenerator new];
+            [done notificationOccurred:UINotificationFeedbackTypeSuccess];
+            return;
+        }
+        if (action == WQMAppActionRestore) {
+            [self loadBackupsAndShowRestorePickerForApp:app];
+            return;
+        }
+        if (action == WQMAppActionInspectSpace) {
+            [self showSpaceLensForApp:app];
+            return;
+        }
+        if (action == WQMAppActionFindFiles) {
+            [self.navigationController pushViewController:[[WQMFilesViewController alloc] initWithApp:app] animated:YES];
+            return;
+        }
+        if (action == WQMAppActionExportCenter) {
+            [self.navigationController pushViewController:[[WQMExportCenterViewController alloc] initWithApp:app] animated:YES];
+            return;
+        }
+        if (action == WQMAppActionCustomBackup) {
+            __weak typeof(self) weakSelf = self;
+            WQMBackupSelectionViewController *picker = [[WQMBackupSelectionViewController alloc] initWithApp:app completion:^(WQMBackupScopeDescriptor *selection) {
+                [weakSelf confirmBackupForApp:app scope:selection];
+            }];
+            [self.navigationController pushViewController:picker animated:YES];
+            return;
+        }
+        WQMBackupScope scope = action == WQMAppActionFullBackup
+            ? WQMBackupScopeFull : WQMBackupScopeQuick;
+        WQMBackupScopeDescriptor *descriptor = [WQMBackupScopeDescriptor descriptorForScope:scope];
+        if (descriptor) [self confirmBackupForApp:app scope:descriptor];
+    };
+    [self presentViewController:actions animated:YES completion:^{
+        actions.presentationController.delegate = self;
+    }];
+}
+
+- (void)refreshApp:(WQMAppModel *)app
+{
+    WQScanCancellation *cancellation = [WQScanCancellation new];
+    if (![WQMLongOperationBanner startOperationWithTitle:WQML(@"APP_REFRESH_ONE", @"刷新这个 App") status:app.displayName cancelHandler:^{ [cancellation cancel]; }]) return;
+    [[WQMAppScanner new] refreshApp:app cancellation:cancellation completion:^(WQMAppModel *updated) {
+        [WQMLongOperationBanner.shared hide];
+        if (!updated) return;
+        NSMutableArray *apps = [self->_apps mutableCopy];
+        NSUInteger index = [apps indexOfObjectPassingTest:^BOOL(WQMAppModel *item, NSUInteger idx, BOOL *stop) { return [item.containerPath isEqual:app.containerPath]; }];
+        if (index == NSNotFound) return;
+        apps[index] = updated; self->_apps = apps;
+        [self rebuildVisibleApps]; [self updateSummary]; [self reloadAppListForDataChange];
+        WQMAppScanResult *result = [WQMAppScanResult new]; result.apps = apps;
+        for (WQMAppModel *item in apps) if (!item.sizeKnown || !item.identityKnown || !item.accessAvailable) result.limitedCount++;
+        dispatch_async(WQMIndexSaveQueue(), ^{ [WQMAppCache saveResult:result recordHistory:NO]; });
+    }];
+}
+
+- (void)showStorageChanges
+{
+    [self.navigationController pushViewController:[[WQMStorageChangesViewController alloc] initWithApps:_apps] animated:YES];
+}
+
+- (void)showBackupQueue
+{
+    if (!_batchController) _batchController = [[WQMBackupQueueViewController alloc] initWithApps:_apps];
+    else [_batchController updateApps:_apps];
+    [self.navigationController pushViewController:_batchController animated:YES];
+}
+
+- (void)showFileAudit
+{
+    [self.navigationController pushViewController:[[WQMFileAuditViewController alloc] initWithApps:_apps] animated:YES];
+}
+
+- (void)showGlobalSearch
+{
+    [self.navigationController pushViewController:[[WQMGlobalFileSearchViewController alloc] initWithApps:_apps] animated:YES];
+}
+
+- (void)showSpaceLensForApp:(WQMAppModel *)app
+{
+    if (!app.containerPath.length) return;
+    WQMSpaceLensViewController *lens = [[WQMSpaceLensViewController alloc] initWithApp:app];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:lens animated:YES];
+        return;
+    }
+    UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:lens];
+    navigation.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:navigation animated:YES completion:nil];
+}
+
+- (void)installSheetBlur
+{
+    if (self.sheetBlurView) return;
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial]];
+    blur.translatesAutoresizingMaskIntoConstraints = NO;
+    blur.userInteractionEnabled = NO;
+    blur.alpha = 0;
+    UIView *host = self.navigationController.view ?: self.view;
+    [host addSubview:blur];
+    [NSLayoutConstraint activateConstraints:@[
+        [blur.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
+        [blur.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
+        [blur.topAnchor constraintEqualToAnchor:host.topAnchor],
+        [blur.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
+    ]];
+    self.sheetBlurView = blur;
+    [UIView animateWithDuration:0.28 animations:^{ blur.alpha = 0.55; }];
+}
+
+- (void)removeSheetBlur
+{
+    UIVisualEffectView *blur = self.sheetBlurView;
+    if (!blur) return;
+    self.sheetBlurView = nil;
+    [UIView animateWithDuration:0.22 animations:^{ blur.alpha = 0; } completion:^(__unused BOOL finished) {
+        [blur removeFromSuperview];
+    }];
+}
+
+- (void)presentationControllerWillDismiss:(__unused UIPresentationController *)presentationController
+{
+    [self removeSheetBlur];
+}
+
+- (void)presentationControllerDidDismiss:(__unused UIPresentationController *)presentationController
+{
+    [self removeSheetBlur];
+}
+
+- (void)loadBackupsAndShowRestorePickerForApp:(WQMAppModel *)app
+{
+    UIAlertController *loading = [UIAlertController alertControllerWithTitle:WQML(@"RESTORE_LOADING_TITLE", @"正在读取备份")
+                                                                     message:WQML(@"PLEASE_WAIT", @"请稍候…")
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:loading animated:YES completion:nil];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<WQMBackupRecord *> *matching = [[WQMBackupStore allBackups]
+            filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:
+            ^BOOL(WQMBackupRecord *backup, NSDictionary *__unused bindings) {
+                return [backup.bundleIdentifier isEqualToString:app.bundleIdentifier];
+            }]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [loading dismissViewControllerAnimated:YES completion:^{
+                if (!matching.count) {
+                    UIAlertController *empty = [UIAlertController
+                        alertControllerWithTitle:WQML(@"RESTORE_NO_BACKUPS_TITLE", @"没有可用备份")
+                        message:[NSString stringWithFormat:
+                                 WQML(@"RESTORE_NO_BACKUPS_MESSAGE", @"%@ 还没有备份记录。"),
+                                 app.displayName]
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [empty addAction:[UIAlertAction actionWithTitle:WQML(@"OK", @"确定")
+                                                              style:UIAlertActionStyleDefault
+                                                            handler:nil]];
+                    [self presentViewController:empty animated:YES completion:nil];
+                    return;
+                }
+                [self showRestorePickerForApp:app backups:matching];
+            }];
+        });
+    });
+}
+
+- (void)showRestorePickerForApp:(WQMAppModel *)app
+                        backups:(NSArray<WQMBackupRecord *> *)backups
+{
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:WQML(@"RESTORE_CHOOSER_TITLE", @"选择恢复备份")
+                                                                   message:app.displayName
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.locale = [WQMLanguageManager sharedManager].locale;
+    formatter.dateStyle = NSDateFormatterMediumStyle;
+    formatter.timeStyle = NSDateFormatterShortStyle;
+    for (WQMBackupRecord *backup in backups) {
+        NSString *title = [NSString stringWithFormat:@"%@ · %@%@",
+                           backup.scopeName,
+                           [formatter stringFromDate:backup.createdAt],
+                           backup.reason.length ? [NSString stringWithFormat:@" · %@", backup.reason] : @""];
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            [self beginRestoreConfirmationForBackup:backup app:app];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:WQML(@"CANCEL", @"取消") style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.tableView;
+    CGRect anchor = self.tableView.bounds;
+    anchor.origin = CGPointMake(CGRectGetMidX(anchor), CGRectGetMidY(anchor));
+    anchor.size = CGSizeMake(1, 1);
+    sheet.popoverPresentationController.sourceRect = anchor;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)beginRestoreConfirmationForBackup:(WQMBackupRecord *)backup app:(WQMAppModel *)app
+{
+    _restoreGate = [WQMConfirmationGate new];
+    NSString *operation = [@"restore:" stringByAppendingString:NSUUID.UUID.UUIDString];
+    if (![_restoreGate beginForOperation:operation]) return;
+
+    NSString *message = [NSString stringWithFormat:
+                         WQML(@"RESTORE_SCOPE_MESSAGE",
+                              @"目标：%@\nBundle ID：%@\n\n将用以下备份替换目标 App 的 %@：\n%@\n\n"
+                               "执行前会先自动备份目标当前数据。恢复期间目标 App 必须保持关闭。"),
+                         app.displayName, app.bundleIdentifier,
+                         [backup.parts componentsJoinedByString:WQML(@"LIST_SEPARATOR", @"、")],
+                         backup.path];
+    message = [message stringByAppendingString:WQMLoadProfileConfirmationLine()];
+    UIAlertController *scopeAlert = [UIAlertController
+        alertControllerWithTitle:WQML(@"RESTORE_SCOPE_TITLE", @"恢复范围确认")
+                         message:message preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [scopeAlert addAction:[UIAlertAction actionWithTitle:WQML(@"CANCEL", @"取消") style:UIAlertActionStyleCancel
+                                                handler:^(__unused UIAlertAction *action) {
+        __strong typeof(weakSelf) self = weakSelf;
+        [self->_restoreGate cancel];
+    }]];
+    [scopeAlert addAction:[UIAlertAction actionWithTitle:WQML(@"UNDERSTOOD_CONTINUE", @"我已了解，继续")
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || ![self->_restoreGate acknowledgeScopeForOperation:operation]) return;
+        [self showFinalRestoreConfirmationForBackup:backup app:app operation:operation];
+    }]];
+    [self presentViewController:scopeAlert animated:YES completion:nil];
+}
+
+- (void)showFinalRestoreConfirmationForBackup:(WQMBackupRecord *)backup
+                                          app:(WQMAppModel *)app
+                                    operation:(NSString *)operation
+{
+    NSString *message = [NSString stringWithFormat:
+                         WQML(@"RESTORE_FINAL_MESSAGE",
+                              @"这是第二次确认。目标 App 当前数据将被清空并由备份替换。\n\n"
+                               "请输入 App 名称“%@”以确认执行。"), app.displayName];
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:WQML(@"RESTORE_FINAL_TITLE", @"最终确认：替换 App 数据")
+                         message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = app.displayName;
+        field.autocorrectionType = UITextAutocorrectionTypeNo;
+        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:WQML(@"CANCEL", @"取消") style:UIAlertActionStyleCancel
+                                            handler:^(__unused UIAlertAction *action) {
+        __strong typeof(weakSelf) self = weakSelf;
+        [self->_restoreGate cancel];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:WQML(@"RESTORE_REPLACE_ACTION", @"替换数据")
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *action) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        NSString *typed = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:
+                           NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (![typed isEqualToString:app.displayName]) {
+            UIAlertController *error = [UIAlertController
+                alertControllerWithTitle:WQML(@"RESTORE_NAME_MISMATCH_TITLE", @"名称不匹配")
+                                 message:WQML(@"RESTORE_NAME_MISMATCH_MESSAGE",
+                                              @"没有执行任何操作，请重新确认。")
+                preferredStyle:UIAlertControllerStyleAlert];
+            [error addAction:[UIAlertAction actionWithTitle:WQML(@"REENTER", @"重新输入") style:UIAlertActionStyleDefault
+                                                    handler:^(__unused UIAlertAction *a) {
+                [self showFinalRestoreConfirmationForBackup:backup app:app operation:operation];
+            }]];
+            [self presentViewController:error animated:YES completion:nil];
+            return;
+        }
+        if (![self->_restoreGate authorizeExecutionForOperation:operation]) return;
+        [self startRestoreBackup:backup app:app];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)startRestoreBackup:(WQMBackupRecord *)backup app:(WQMAppModel *)app
+{
+    WQMLongOperationBanner *banner = WQMLongOperationBanner.shared;
+    if (![WQMLongOperationBanner startOperationWithTitle:WQML(@"RESTORE_PROGRESS_TITLE", @"正在恢复")
+                                                  status:WQML(@"PREPARING", @"准备中…")
+                                           cancelHandler:nil]) return;
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+    WQMRestoreService *service = [WQMRestoreService new];
+    [service restoreBackup:backup toApp:app progress:^(NSString *status) {
+        [banner updateStatus:status];
+    } completion:^(BOOL success, NSString *message, NSError *error) {
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+        [banner hideWithCompletion:^{
+            UIAlertController *result = [UIAlertController
+                alertControllerWithTitle:success
+                    ? WQML(@"RESTORE_COMPLETE_TITLE", @"恢复完成")
+                    : WQML(@"RESTORE_INCOMPLETE_TITLE", @"恢复未完成")
+                                 message:message ?: error.localizedDescription
+                          preferredStyle:UIAlertControllerStyleAlert];
+            __weak typeof(self) weakSelf = self;
+            [result addAction:[UIAlertAction actionWithTitle:WQML(@"OK", @"确定")
+                                                       style:UIAlertActionStyleDefault
+                                                     handler:^(__unused UIAlertAction *a) {
+                [weakSelf scan];
+            }]];
+            if (!success) [result addAction:[UIAlertAction actionWithTitle:WQML(@"ACCESS_TITLE", @"访问能力") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                [self.navigationController pushViewController:[[WQMAccessViewController alloc] initWithApp:app] animated:YES];
+            }]];
+            [WQMAlertPresenter presentViewController:result animated:YES completion:nil];
+        }];
+    }];
+}
+
+- (void)confirmBackupForApp:(WQMAppModel *)app scope:(WQMBackupScopeDescriptor *)scope
+{
+    NSString *message = [NSString stringWithFormat:
+                         WQML(@"BACKUP_CONFIRM_MESSAGE",
+                              @"%@\n\n%@\n目录：%@\n\n备份期间请保持目标 App 关闭。"
+                               "这不是文件系统快照，运行中的数据可能导致备份失败。"),
+                         scope.title, scope.detail,
+                         [scope.relativePaths componentsJoinedByString:@", "]];
+    message = [message stringByAppendingString:WQMLoadProfileConfirmationLine()];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:WQML(@"BACKUP_CONFIRM_TITLE", @"开始备份？")
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:WQML(@"CANCEL", @"取消") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:WQML(@"BACKUP_START", @"开始备份")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self startBackupForApp:app scope:scope];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)startBackupForApp:(WQMAppModel *)app scope:(WQMBackupScopeDescriptor *)scope
+{
+    WQMLongOperationBanner *banner = WQMLongOperationBanner.shared;
+    if (![WQMLongOperationBanner startOperationWithTitle:WQML(@"BACKUP_PROGRESS_TITLE", @"正在备份")
+                                                  status:WQML(@"PREPARING", @"准备中…")
+                                           cancelHandler:nil]) return;
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+
+    WQMBackupService *service = [WQMBackupService new];
+    [service backupApp:app selection:scope reason:@"" progress:^(NSString *status) {
+        [banner updateStatus:status];
+    } completion:^(WQMBackupRecord *backup, NSError *error) {
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+        [banner hideWithCompletion:^{
+            UIAlertController *result = [UIAlertController
+                alertControllerWithTitle:error
+                    ? WQML(@"BACKUP_FAILED_TITLE", @"备份失败")
+                    : WQML(@"BACKUP_COMPLETE_TITLE", @"备份完成")
+                message:error ? error.localizedDescription
+                               : [NSString stringWithFormat:@"%@\n%@\n%@",
+                                  backup.displayName, backup.scopeName, backup.path]
+                preferredStyle:UIAlertControllerStyleAlert];
+            [result addAction:[UIAlertAction actionWithTitle:WQML(@"OK", @"确定")
+                                                       style:UIAlertActionStyleDefault
+                                                     handler:nil]];
+            if (error != nil) [result addAction:[UIAlertAction actionWithTitle:WQML(@"ACCESS_TITLE", @"访问能力") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                [self.navigationController pushViewController:[[WQMAccessViewController alloc] initWithApp:app] animated:YES];
+            }]];
+            [WQMAlertPresenter presentViewController:result animated:YES completion:nil];
+        }];
+    }];
+}
+
+@end
+

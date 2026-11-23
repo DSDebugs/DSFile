@@ -1,0 +1,216 @@
+# Building and running WQManager
+
+## Requirements
+
+- macOS with Xcode **27.2** or later (iOS 26 SDK).
+- Deployment target: **iOS 26.0**.
+- Simulator for UI work; a physical iOS 26+ device for container access.
+- For device builds: a signing identity and an App Group. App Groups require a
+  paid Apple Developer account; free provisioning cannot enable them and builds
+  expire after 7 days.
+
+## Identifiers used by this repository
+
+| Item | Value |
+|---|---|
+| Main app bundle ID | `mumu.pduola.WQManager` |
+| Share extension bundle ID | `mumu.pduola.WQManager.Share` |
+| App Group | `group.mumu.wqmanager` |
+| Scheme | `WQManager` |
+| Deployment target | `26.0` |
+| Marketing version | `0.5` (build `1`, release revision `0.5.0`) |
+
+If you fork the project, change the bundle identifiers, the App Group, and the
+entitlements of **both** targets to your own values. The app and the share
+extension must share the same group.
+
+## Simulator build
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild \
+  -project WQManager/WQManager.xcodeproj \
+  -scheme WQManager \
+  -configuration Debug \
+  -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /tmp/WQManager-DerivedData \
+  CODE_SIGNING_ALLOWED=NO \
+  build
+```
+
+Install and launch:
+
+```sh
+xcrun simctl install booted \
+  /tmp/WQManager-DerivedData/Build/Products/Debug-iphonesimulator/WQManager.app
+xcrun simctl launch booted mumu.pduola.WQManager
+```
+
+On the simulator the sandbox is mostly disabled, so container access and some
+icon paths succeed even where a stock device would refuse them. Do not treat
+simulator icon results as device evidence.
+
+## Device build
+
+1. Open `WQManager/WQManager.xcodeproj` in Xcode.
+2. Select both targets and set your Team under **Signing & Capabilities**.
+3. Replace the bundle identifiers and App Group with your own.
+4. Keep the App Group capability on both the app and the share extension.
+5. Build to your device.
+
+Command-line device builds need a provisioning profile:
+
+```sh
+xcodebuild \
+  -project WQManager/WQManager.xcodeproj \
+  -scheme WQManager \
+  -configuration Release \
+  -destination 'generic/platform=iOS' \
+  DEVELOPMENT_TEAM=<YOUR_TEAM_ID> \
+  CODE_SIGN_STYLE=Automatic \
+  build
+```
+
+The repository does not ship signing material. `dist/` (local IPAs and
+entitlements) is ignored by Git.
+
+## IPA naming
+
+IPA filenames must match the assets on GitHub. Use the marketing version and
+the current build number, not the release tag or a feature suffix:
+
+```text
+WQManager-<marketing>-build<build>-unsigned.ipa
+WQManager-<marketing>-build<build>-dev.ipa
+```
+
+Example for 0.5 build 1: `WQManager-0.5-build1-unsigned.ipa`. Do not use names
+such as `WQManager-0.5.0-beta-dev.ipa`.
+
+## Tests
+
+```sh
+python3 tests/check_project.py
+bash tests/run_tests.sh
+```
+
+The script compiles the portable parts of the safety, backup store, operation
+store and backup archive layers with `clang` and runs them directly. It needs no
+simulator, no signing and no network.
+
+## Debug switches
+
+All of these are read from the process environment (set them with
+`SIMCTL_CHILD_` on the simulator, or via the scheme on device) and are compiled
+only in `DEBUG` builds.
+
+| Variable | Effect |
+|---|---|
+| `WQM_ICON_DIAG=1` | enable the icon diagnostic log file (disabled by default) |
+| `WQM_ICON_DIAG_ALL=1` | diagnose every scanned app (default: first 12) |
+| `WQM_ICON_DIAG_DUMP=1` | dump raw icon records to `Documents/` |
+| `WQM_ICON_REMOTE=0` | disable App Store artwork lookup |
+| `WQM_UI_FIXTURES=1` | use fixed demo data instead of scanning; also seeds four demo backups |
+| `WQM_UI_FIXTURES_TAB=n` | open tab `n` (0 apps, 1 backups, 2 cleaner, 3 history, 4 settings) |
+| `WQM_UI_HISTORY_EXPAND=1` | expand all history groups |
+| `WQM_UI_SETTINGS_DOC=n` | push document row `n` in Settings |
+| `WQM_UI_SETTINGS_SCROLL=1` | scroll Settings to the bottom |
+| `WQM_UI_BACKUP_QUERY=wx` | prefill the backup search field |
+| `WQM_UI_ACTION_PANEL=1` | open the action sheet for the first app |
+| `WQM_UI_FEATURE=files` | open a new feature with fixture data: `files`, `history`, `trend`, `batch`, `selection`, `backup`, `compare`, `sqlite`, `plist`, `text`, `image`, or `diagnostics` |
+| `WQM_UI_RESEED_BACKUPS=1` | add backup fixtures for comparison screenshots (Debug only) |
+| `WQM_UI_LENS=1` | push the Space Lens for the first app (fixture app 微信 gets a synthetic 13.71 GB container) |
+| `WQM_UI_LENS_APP=com.tencent.xin` | pick which app the Space Lens opens |
+| `WQM_UI_LENS_DRILL=Library/WeChatMM` | drill straight into that folder path |
+| `WQM_UI_LENS_PREVIEW=settings.json` | open the file preview for that name in the current level |
+| `WQM_UI_LENS_LIST=1` | open the Space Lens in list mode |
+| `WQM_UI_LENS_PICK=2` | with list mode, select the first two rows (shows the action bar) |
+| `WQM_UI_LENS_EXPORT=1` | run the export flow for the current selection |
+| `WQM_UI_LENS_DELETE_PROMPT=1` | open the delete confirmation for the current selection |
+| `WQM_UI_LENS_DELETE_NOW=1` | delete the selection without the dialogs (skips confirmation, for screenshots only) |
+| `WQM_UI_TRASH=1` | open Settings and push the Space Lens bin straight away |
+| `WQM_UI_TRASH_EMPTY=1` | empty the bin before pushing it (shows the empty state) |
+| `WQM_UI_APPEARANCE=light` | force the window into light mode (`dark` for dark) |
+
+Icon diagnostics are written to `Documents/icon-diag-<timestamp>.log` inside the
+app container and are visible through the Files app
+(`On My iPhone/WQManager`).
+
+## Troubleshooting
+
+### `Failed to write Objective-C generated asset symbols`
+
+Symptom:
+
+```
+Assets.xcassets: error: Failed to write Objective-C generated asset symbols.
+You don't have permission to save the file "GeneratedAssetSymbols.h"
+in the folder "DerivedSources"
+Operation not permitted
+```
+
+The asset compiler (`actool`) could not write its generated symbol files into
+the build's `DerivedSources` directory. This is a build-environment problem, not
+an asset-catalog problem. In order:
+
+1. Quit Xcode and delete the project's DerivedData:
+   `rm -rf ~/Library/Developer/Xcode/DerivedData/WQManager-*`
+2. Reopen the project and do a clean build.
+3. If it persists, restart the build service:
+   `pkill -f XCBBuildService`
+4. Check disk space and file ownership of
+   `DerivedData/WQManager-*/Build/Intermediates.noindex/.../DerivedSources`.
+5. As a last resort disable symbol generation:
+   `ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO`.
+
+### Third-party icons are letter tiles
+
+Expected on stock devices: iOS refuses third-party icon requests
+(`-609`). The app then tries App Store artwork; apps without an App Store ID
+remain letter tiles. See the README section "Icons on stock iOS".
+
+### `wq_grant` fails for an app
+
+Container access depends on the App Group + `worse_query` extension trick. Make
+sure both targets carry `group.mumu.wqmanager`, the app is signed with a valid
+profile, and the device was not logged out/restarted in a way that invalidated
+the extension. Re-scan from Settings → "Clear App Index Cache".
+
+### Backups appear but restore refuses
+
+Restore requires the same bundle ID to be installed, closed and identity-verified.
+Stale identity data after an app update is handled by re-scanning.
+
+## UI regression tests
+
+Install a Debug simulator build first. The UI suite uses an already installed
+`mumu.pduola.WQManager` app and synthetic files under its `tmp/WQMContainerFixture`.
+It never scans real app data. Supply a booted simulator UDID:
+
+```sh
+python3 tests/UI/prepare_fixtures.py SIMULATOR_UDID
+xcodebuild -project tests/UI/WQMUITests.xcodeproj -scheme WQMUITests \
+  -destination 'platform=iOS Simulator,id=SIMULATOR_UDID' \
+  -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
+```
+
+The suite covers plist navigation, SQLite paging/export, file search, direct
+access diagnostics, large-image preview and truncated-text layout. Screenshots
+are attached to the `.xcresult` bundle. Use `DEVELOPER_DIR` if Command Line Tools
+are selected globally.
+
+Hosted macOS runners use Xcode 26+ and an isolated conventional project generated
+from `project.xcproj` settings. `tests/prepare_ci_project.rb` needs the pinned
+`xcodeproj` gem (1.27.0), copies only the two source folders into a new destination,
+and includes the share extension, shared inbox source, localized resources and
+SQLite linkage. It never edits the main Xcode 27.2 project. CI builds this copy,
+creates its own iOS 26+ simulator, and runs the same UI suite. For a local check:
+
+```sh
+gem install xcodeproj --version 1.27.0 --no-document --user-install
+ruby tests/prepare_ci_project.rb /tmp/WQManager-CI
+xcodebuild -project /tmp/WQManager-CI/WQManager.xcodeproj -scheme WQManager \
+  -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO build
+```
