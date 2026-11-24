@@ -54,7 +54,7 @@ static BOOL WQMArchiveVerifyPayload(WQMBackupRecord *backup, NSString **reason)
 
 + (NSString *)backupContentTypeIdentifier
 {
-    return @"com.mumu.wqmanager.backup";
+    return @"com.DSFile.app.backup";
 }
 
 - (void)prepareExportForBackup:(WQMBackupRecord *)backup

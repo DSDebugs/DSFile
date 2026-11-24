@@ -120,7 +120,6 @@ static NSString *WQMLoadProfileName(WQMLoadProfile profile)
 typedef NS_ENUM(NSInteger, WQMSettingsRow) {
     WQMSettingsRowLanguage = 0,
     WQMSettingsRowVersion,
-    WQMSettingsRowCheckUpdate,
     WQMSettingsRowSigning,
     WQMSettingsRowIndex,
     WQMSettingsRowClearIndex,
@@ -149,7 +148,6 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
     NSUInteger _operationCount;
     BOOL _hasAppGroup;
     BOOL _presentedFixtureDocument;
-    BOOL _checkingUpdate;
 }
 
 - (instancetype)init
@@ -255,7 +253,7 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    if (section == 0) return 5;
+    if (section == 0) return 4;
     if (section == 1) return 8;
     if (section == 2) return 4;
     return 2;
@@ -271,7 +269,7 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
-    if (section == 3) return [NSString stringWithFormat:WQML(@"DEVELOPMENT_FOOTER", @"WQManager %@ 为开发预览版本。"), _versionText ?: @""];
+    if (section == 3) return [NSString stringWithFormat:WQML(@"DEVELOPMENT_FOOTER", @"DSFile %@ 为开发预览版本。"), _versionText ?: @""];
     return nil;
 }
 
@@ -300,18 +298,12 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
         content.image = [UIImage systemImageNamed:@"app.badge"];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
     } else if (indexPath.section == 0 && indexPath.row == 2) {
-        content.text = WQML(@"SETTINGS_CHECK_UPDATE", @"检测更新");
-        content.secondaryText = [NSString stringWithFormat:
-                                 WQML(@"SETTINGS_CHECK_UPDATE_SUB", @"当前 %@"), _versionText ?: @""];
-        content.image = [UIImage systemImageNamed:@"arrow.triangle.2.circlepath"];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (indexPath.section == 0 && indexPath.row == 3) {
         content.text = WQML(@"SIGNING_STATUS", @"签名状态");
         content.secondaryText = _signingText;
         content.image = [UIImage systemImageNamed:
                          _hasAppGroup ? @"checkmark.seal.fill" : @"exclamationmark.triangle.fill"];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else if (indexPath.section == 0 && indexPath.row == 4) {
+    } else if (indexPath.section == 0 && indexPath.row == 3) {
         content.text = WQML(@"ACCESS_TITLE", @"访问能力");
         content.secondaryText = WQML(@"ACCESS_SETTINGS_SUB", @"检查受限原因与导出脱敏报告");
         content.image = [UIImage systemImageNamed:@"stethoscope"];
@@ -413,11 +405,7 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
         [self showLanguageSelectorFromCell:[tableView cellForRowAtIndexPath:indexPath]];
         return;
     }
-    if (indexPath.section == 0 && indexPath.row == 2) {
-        [self checkForUpdatesFromCell:[tableView cellForRowAtIndexPath:indexPath]];
-        return;
-    }
-    if (indexPath.section == 0 && indexPath.row == 4) {
+    if (indexPath.section == 0 && indexPath.row == 3) {
         [self.navigationController pushViewController:[WQMAccessViewController new] animated:YES];
         return;
     }
@@ -495,110 +483,6 @@ static NSString *WQMTrashBytesText(unsigned long long bytes)
     controller.documentText = text;
     controller.reflowPlainText = indexPath.row == 2;
     [self.navigationController pushViewController:controller animated:YES];
-}
-
-- (void)checkForUpdatesFromCell:(UITableViewCell *)cell
-{
-    if (_checkingUpdate) return;
-    _checkingUpdate = YES;
-    if (cell) {
-        UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc]
-            initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-        spinner.color = WQMTheme.textSecondaryColor;
-        [spinner startAnimating];
-        cell.accessoryView = spinner;
-    }
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
-        [NSURL URLWithString:[WQM_REPOSITORY_RELEASES_URL stringByAppendingString:@"/latest"]]];
-    request.timeoutInterval = 12;
-    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) WQManager"
-   forHTTPHeaderField:@"User-Agent"];
-    __weak typeof(self) weakSelf = self;
-    [[NSURLSession.sharedSession dataTaskWithRequest:request
-        completionHandler:^(__unused NSData *data, NSURLResponse *response, NSError *error) {
-        NSString *tag = nil;
-        NSString *page = nil;
-        if (!error) {
-            NSURL *finalURL = response.URL;
-            NSString *path = finalURL.path ?: @"";
-            NSRange marker = [path rangeOfString:@"/releases/tag/"];
-            if (marker.location != NSNotFound) {
-                tag = [path substringFromIndex:NSMaxRange(marker)];
-                page = finalURL.absoluteString;
-            }
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            WQMSettingsViewController *strongSelf = weakSelf;
-            if (!strongSelf) return;
-            strongSelf->_checkingUpdate = NO;
-            UITableViewCell *row = [strongSelf.tableView
-                cellForRowAtIndexPath:[NSIndexPath indexPathForRow:WQMSettingsRowCheckUpdate inSection:0]];
-            row.accessoryView = nil;
-            row.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            if (!tag.length) {
-                [strongSelf showUpdateAlertWithTitle:WQML(@"UPDATE_FAILED_TITLE", @"检测失败")
-                                             message:WQML(@"UPDATE_FAILED_MESSAGE",
-                                                          @"无法连接 GitHub，请稍后重试。")
-                                                 url:nil];
-                return;
-            }
-            // The visible version stays 0.4; release revisions keep update detection monotonic.
-            NSString *releaseVersion = NSBundle.mainBundle.infoDictionary[@"WQMReleaseVersion"] ?: strongSelf->_versionText;
-            if ([strongSelf versionTag:tag isNewerThan:releaseVersion]) {
-                [strongSelf showUpdateAlertWithTitle:
-                    [NSString stringWithFormat:WQML(@"UPDATE_AVAILABLE_TITLE", @"发现新版本 %@"), tag]
-                                             message:[NSString stringWithFormat:
-                                                      WQML(@"UPDATE_AVAILABLE_MESSAGE",
-                                                           @"当前 %@，是否前往 GitHub 查看？"),
-                                                      strongSelf->_versionText]
-                                                 url:page ?: WQM_REPOSITORY_RELEASES_URL];
-            } else {
-                [strongSelf showUpdateAlertWithTitle:WQML(@"UPDATE_UP_TO_DATE_TITLE", @"已是最新版本")
-                                             message:[NSString stringWithFormat:
-                                                      WQML(@"UPDATE_UP_TO_DATE_MESSAGE",
-                                                           @"当前 %@ 已是最新版本。"),
-                                                      strongSelf->_versionText]
-                                                 url:nil];
-            }
-        });
-    }] resume];
-}
-
-- (BOOL)versionTag:(NSString *)tag isNewerThan:(NSString *)current
-{
-    NSString *clean = [tag hasPrefix:@"v"] ? [tag substringFromIndex:1] : tag;
-    clean = [[clean componentsSeparatedByCharactersInSet:
-              [NSCharacterSet characterSetWithCharactersInString:@" -+"]].firstObject
-             stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-    NSString *currentClean = [[current componentsSeparatedByString:@" "].firstObject
-                              stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-    NSArray<NSString *> *newParts = [clean componentsSeparatedByString:@"."];
-    NSArray<NSString *> *oldParts = [currentClean componentsSeparatedByString:@"."];
-    NSUInteger count = MAX(newParts.count, oldParts.count);
-    for (NSUInteger index = 0; index < count; index++) {
-        NSInteger newValue = index < newParts.count ? newParts[index].integerValue : 0;
-        NSInteger oldValue = index < oldParts.count ? oldParts[index].integerValue : 0;
-        if (newValue != oldValue) return newValue > oldValue;
-    }
-    return NO;
-}
-
-- (void)showUpdateAlertWithTitle:(NSString *)title message:(NSString *)message url:(NSString *)urlString
-{
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                   message:message
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:WQML(@"CANCEL", @"取消")
-                                              style:UIAlertActionStyleCancel handler:nil]];
-    if (urlString.length) {
-        [alert addAction:[UIAlertAction actionWithTitle:WQML(@"UPDATE_OPEN", @"前往查看")
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
-            NSURL *url = [NSURL URLWithString:urlString];
-            if (url) [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
-        }]];
-    }
-    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)showLoadProfileSelectorFromCell:(UITableViewCell *)cell

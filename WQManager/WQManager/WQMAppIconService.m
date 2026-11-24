@@ -66,7 +66,7 @@ static NSOperationQueue *WQMAppIconWorkQueue(void)
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         queue = [NSOperationQueue new];
-        queue.name = @"com.mumu.wqmanager.app-icons";
+        queue.name = @"com.DSFile.app.app-icons";
         queue.maxConcurrentOperationCount = 2;
         queue.qualityOfService = NSQualityOfServiceUserInitiated;
     });
@@ -243,7 +243,7 @@ static NSArray<NSData *> *WQMAppIconPlaceholderFingerprints(void)
     dispatch_once(&onceToken, ^{
         NSMutableArray<NSData *> *items = [NSMutableArray new];
         NSArray<NSString *> *probeIdentifiers = @[
-            @"com.mumu.wqmanager.nonexistent-app",
+            @"com.DSFile.app.nonexistent-app",
             @"cz.kolbi.wqfiles.no-such-app",
         ];
         for (NSString *probe in probeIdentifiers) {
@@ -362,7 +362,7 @@ static NSString *WQMAppIconSystemPlaceholderDigest(void)
     static NSString *digest;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIImage *probe = WQMIconServicesIcon(@"com.mumu.wqmanager.placeholder-probe");
+        UIImage *probe = WQMIconServicesIcon(@"com.DSFile.app.placeholder-probe");
         if (probe) digest = WQMAppIconDigestOfImage(probe);
     });
     return digest;
@@ -1460,243 +1460,6 @@ static UIImage *WQMResolveIcon(NSString *bundleIdentifier)
     return raw ? WQMRoundIcon(raw) : nil;
 }
 
-#pragma mark - Remote icons
-
-// When the local icon services are blocked (unjailbroken devices without the
-// iconservices entitlement), fall back to the public App Store artwork lookup.
-// Only App Store apps resolve; sideloaded bundles simply keep the letter tile.
-
-static BOOL WQMAppIconRemoteEnabled(void)
-{
-    NSString *environment = NSProcessInfo.processInfo.environment[@"WQM_ICON_REMOTE"];
-    if (environment.length && !environment.boolValue) return NO;
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    if ([defaults objectForKey:@"WQMAppIconRemoteEnabled"]) {
-        return [defaults boolForKey:@"WQMAppIconRemoteEnabled"];
-    }
-    return YES;
-}
-
-static NSMutableSet<NSString *> *WQMAppIconRemotePending(void)
-{
-    static NSMutableSet *pending;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ pending = [NSMutableSet new]; });
-    return pending;
-}
-
-static NSMutableSet<NSString *> *WQMAppIconFallbackIdentifiers(void)
-{
-    static NSMutableSet *identifiers;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ identifiers = [NSMutableSet new]; });
-    return identifiers;
-}
-
-static NSMutableDictionary<NSString *, NSNumber *> *WQMAppIconRemoteMisses(void)
-{
-    static NSMutableDictionary *misses;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSDictionary *stored = [NSUserDefaults.standardUserDefaults
-                                dictionaryForKey:@"WQMAppIconRemoteMisses"];
-        misses = [NSMutableDictionary dictionaryWithDictionary:stored ?: @{}];
-    });
-    return misses;
-}
-
-static void WQMAppIconPersistRemoteMisses(void)
-{
-    NSDictionary *snapshot;
-    @synchronized (WQMAppIconRemoteMisses()) {
-        snapshot = [WQMAppIconRemoteMisses() copy];
-    }
-    [NSUserDefaults.standardUserDefaults setObject:snapshot
-                                           forKey:@"WQMAppIconRemoteMisses"];
-}
-
-static BOOL WQMAppIconRemoteRecentlyMissed(NSString *bundleIdentifier)
-{
-    NSNumber *timestamp;
-    @synchronized (WQMAppIconRemoteMisses()) {
-        timestamp = WQMAppIconRemoteMisses()[bundleIdentifier];
-    }
-    if (timestamp == nil) return NO;
-    return [NSDate date].timeIntervalSince1970 - timestamp.doubleValue < 24 * 60 * 60;
-}
-
-static void WQMAppIconRecordRemoteMiss(NSString *bundleIdentifier)
-{
-    @synchronized (WQMAppIconRemoteMisses()) {
-        WQMAppIconRemoteMisses()[bundleIdentifier] =
-            @([NSDate date].timeIntervalSince1970);
-    }
-    WQMAppIconPersistRemoteMisses();
-}
-
-static void WQMAppIconClearRemoteMiss(NSString *bundleIdentifier)
-{
-    @synchronized (WQMAppIconRemoteMisses()) {
-        [WQMAppIconRemoteMisses() removeObjectForKey:bundleIdentifier];
-    }
-    WQMAppIconPersistRemoteMisses();
-}
-
-static NSURLSession *WQMAppIconRemoteSession(void)
-{
-    static NSURLSession *session;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSURLSessionConfiguration *configuration =
-            [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        configuration.timeoutIntervalForRequest = 10;
-        configuration.timeoutIntervalForResource = 20;
-        configuration.HTTPAdditionalHeaders = @{@"User-Agent": @"WQManager/0.1"};
-        session = [NSURLSession sessionWithConfiguration:configuration];
-    });
-    return session;
-}
-
-static void WQMAppIconApplyRemoteImage(UIImage *image, NSString *bundleIdentifier)
-{
-    if (!WQMAppIconLooksUsable(image) ||
-        WQMAppIconLooksLikeKnownPlaceholder(image) ||
-        WQMAppIconIsKnownGenericPlaceholderImage(image)) return;
-    UIImage *rounded = WQMRoundIcon(image);
-    WQMAppIconStoreDiskImage(rounded, bundleIdentifier);
-    @synchronized (WQMAppIconFallbackIdentifiers()) {
-        [WQMAppIconFallbackIdentifiers() removeObject:bundleIdentifier];
-    }
-    [WQMAppIconMemoryCache() setObject:rounded forKey:bundleIdentifier];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSNotificationCenter.defaultCenter
-            postNotificationName:WQMAppIconDidResolveNotification
-                          object:nil
-                        userInfo:@{WQMAppIconBundleIdentifierKey: bundleIdentifier}];
-    });
-}
-
-static void WQMAppIconDownloadRemoteImage(NSString *artwork, NSString *bundleIdentifier)
-{
-    NSURLSessionDataTask *download =
-        [WQMAppIconRemoteSession() dataTaskWithURL:[NSURL URLWithString:artwork]
-                                completionHandler:^(NSData *imageData, NSURLResponse *response,
-                                                    NSError *error) {
-        UIImage *image = imageData.length ? [UIImage imageWithData:imageData] : nil;
-        if (image) {
-            WQMAppIconClearRemoteMiss(bundleIdentifier);
-            WQMAppIconApplyRemoteImage(image, bundleIdentifier);
-        }
-        WQMAppIconDiag(@"id=%@ remote=%@ size=%@", bundleIdentifier,
-                       image ? @"image" : @"nil", NSStringFromCGSize(image.size));
-        @synchronized (WQMAppIconRemotePending()) {
-            [WQMAppIconRemotePending() removeObject:bundleIdentifier];
-        }
-    }];
-    [download resume];
-}
-
-static void WQMAppIconLookupArtwork(NSString *bundleIdentifier, NSString *country,
-                                    void (^completion)(NSString *artwork, BOOL definitive))
-{
-    NSURLComponents *components =
-        [NSURLComponents componentsWithString:@"https://itunes.apple.com/lookup"];
-    NSMutableArray<NSURLQueryItem *> *items = [NSMutableArray arrayWithObjects:
-        [NSURLQueryItem queryItemWithName:@"bundleId" value:bundleIdentifier],
-        [NSURLQueryItem queryItemWithName:@"limit" value:@"1"], nil];
-    if (country.length) {
-        [items addObject:[NSURLQueryItem queryItemWithName:@"country" value:country]];
-    }
-    components.queryItems = items;
-    NSURLSessionDataTask *lookup =
-        [WQMAppIconRemoteSession() dataTaskWithURL:components.URL
-                                completionHandler:^(NSData *data, NSURLResponse *response,
-                                                    NSError *error) {
-        NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
-            ? ((NSHTTPURLResponse *)response).statusCode : 0;
-        BOOL definitive = NO;
-        NSString *artwork = nil;
-        if (data.length) {
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([json isKindOfClass:NSDictionary.class]) {
-                definitive = status == 200;
-                NSArray *results = json[@"results"];
-                if ([results isKindOfClass:NSArray.class] && results.count) {
-                    NSDictionary *item = results.firstObject;
-                    if ([item isKindOfClass:NSDictionary.class]) {
-                        for (NSString *key in @[@"artworkUrl512", @"artworkUrl100", @"artworkUrl60"]) {
-                            NSString *value = item[key];
-                            if ([value isKindOfClass:NSString.class] && value.length) {
-                                artwork = value;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        completion(artwork, definitive);
-    }];
-    [lookup resume];
-}
-
-static void WQMAppIconFinishRemote(NSString *bundleIdentifier)
-{
-    @synchronized (WQMAppIconRemotePending()) {
-        [WQMAppIconRemotePending() removeObject:bundleIdentifier];
-    }
-}
-
-static void WQMAppIconRunRemoteLookup(NSString *bundleIdentifier, NSString *country,
-                                      NSInteger attempt)
-{
-    WQMAppIconLookupArtwork(bundleIdentifier, country, ^(NSString *artwork, BOOL definitive) {
-        if (artwork.length) {
-            WQMAppIconDownloadRemoteImage(artwork, bundleIdentifier);
-            return;
-        }
-        if (!definitive && attempt < 1) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                WQMAppIconRunRemoteLookup(bundleIdentifier, country, attempt + 1);
-            });
-            return;
-        }
-        if (country.length == 0) {
-            WQMAppIconRunRemoteLookup(bundleIdentifier, @"cn", 0);
-            return;
-        }
-        if (definitive) {
-            WQMAppIconRecordRemoteMiss(bundleIdentifier);
-            WQMAppIconDiag(@"id=%@ remote=miss", bundleIdentifier);
-        } else {
-            WQMAppIconDiag(@"id=%@ remote=error", bundleIdentifier);
-        }
-        WQMAppIconFinishRemote(bundleIdentifier);
-    });
-}
-
-static void WQMAppIconFetchRemoteIcon(NSString *bundleIdentifier)
-{
-    if (!bundleIdentifier.length || !WQMAppIconRemoteEnabled()) return;
-    if (WQMAppIconRemoteRecentlyMissed(bundleIdentifier)) return;
-    @synchronized (WQMAppIconRemotePending()) {
-        if ([WQMAppIconRemotePending() containsObject:bundleIdentifier]) return;
-        [WQMAppIconRemotePending() addObject:bundleIdentifier];
-    }
-    static NSTimeInterval lastStart;
-    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    NSTimeInterval delay = 0;
-    @synchronized (WQMAppIconService.class) {
-        delay = MAX(0, 0.25 - (now - lastStart));
-        lastStart = now + delay;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        WQMAppIconRunRemoteLookup(bundleIdentifier, nil, 0);
-    });
-}
-
 @implementation WQMAppIconService
 
 + (UIImage *)iconForBundleIdentifier:(NSString *)bundleIdentifier displayName:(NSString *)displayName
@@ -1709,33 +1472,7 @@ static void WQMAppIconFetchRemoteIcon(NSString *bundleIdentifier)
 + (void)requestIconForBundleIdentifier:(NSString *)bundleIdentifier displayName:(NSString *)displayName
 {
     if (!bundleIdentifier.length) return;
-    UIImage *cached = [WQMAppIconMemoryCache() objectForKey:bundleIdentifier];
-    if (cached) {
-        BOOL fallback = NO;
-        @synchronized (WQMAppIconFallbackIdentifiers()) {
-            fallback = [WQMAppIconFallbackIdentifiers() containsObject:bundleIdentifier];
-        }
-        if (fallback) {
-            [WQMAppIconWorkQueue() addOperationWithBlock:^{
-                UIImage *disk = WQMAppIconDiskImage(bundleIdentifier);
-                if (disk) {
-                    @synchronized (WQMAppIconFallbackIdentifiers()) {
-                        [WQMAppIconFallbackIdentifiers() removeObject:bundleIdentifier];
-                    }
-                    [WQMAppIconMemoryCache() setObject:disk forKey:bundleIdentifier];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [NSNotificationCenter.defaultCenter
-                            postNotificationName:WQMAppIconDidResolveNotification
-                                          object:nil
-                                        userInfo:@{WQMAppIconBundleIdentifierKey: bundleIdentifier}];
-                    });
-                } else if (!WQMAppIconRemoteRecentlyMissed(bundleIdentifier)) {
-                    WQMAppIconFetchRemoteIcon(bundleIdentifier);
-                }
-            }];
-        }
-        return;
-    }
+    if ([WQMAppIconMemoryCache() objectForKey:bundleIdentifier]) return;
     if (NSThread.isMainThread) WQMAppIconRenderScale = WQMAppIconCurrentScreenScale();
     NSUInteger generation;
     @synchronized (WQMAppIconPendingIdentifiers()) {
@@ -1753,25 +1490,11 @@ static void WQMAppIconFetchRemoteIcon(NSString *bundleIdentifier)
         UIImage *diskIcon = WQMAppIconDiskImage(bundleIdentifier);
         UIImage *resolved = diskIcon ?: WQMResolveIcon(bundleIdentifier);
         if (generation != currentGeneration) return;
-        if (!resolved) WQMAppIconFetchRemoteIcon(bundleIdentifier);
-        BOOL actualIcon = resolved != nil;
         UIImage *icon = resolved ?: WQMFallbackIcon(bundleIdentifier, displayName);
-        if (actualIcon) {
+        if (resolved) {
             WQMAppIconStoreDiskImage(icon, bundleIdentifier);
-            @synchronized (WQMAppIconFallbackIdentifiers()) {
-                [WQMAppIconFallbackIdentifiers() removeObject:bundleIdentifier];
-            }
-            [WQMAppIconMemoryCache() setObject:icon forKey:bundleIdentifier];
-        } else {
-            @synchronized (WQMAppIconFallbackIdentifiers()) {
-                [WQMAppIconFallbackIdentifiers() addObject:bundleIdentifier];
-            }
-            // A remote image may have landed while we were resolving; do not
-            // replace a real icon with the letter fallback.
-            if (![WQMAppIconMemoryCache() objectForKey:bundleIdentifier]) {
-                [WQMAppIconMemoryCache() setObject:icon forKey:bundleIdentifier];
-            }
         }
+        [WQMAppIconMemoryCache() setObject:icon forKey:bundleIdentifier];
         @synchronized (WQMAppIconPendingIdentifiers()) {
             [WQMAppIconPendingIdentifiers() removeObject:bundleIdentifier];
         }

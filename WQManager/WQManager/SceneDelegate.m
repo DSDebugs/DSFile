@@ -119,7 +119,7 @@
     BOOL requestedSharedImport = NO;
     for (UIOpenURLContext *context in contexts) {
         NSURL *url = context.URL;
-        if ([url.scheme caseInsensitiveCompare:@"wqmanager"] == NSOrderedSame &&
+        if ([url.scheme caseInsensitiveCompare:@"dsfile"] == NSOrderedSame &&
             [url.host caseInsensitiveCompare:@"import"] == NSOrderedSame) {
             self.pendingManualImportPicker = YES;
             requestedSharedImport = YES;

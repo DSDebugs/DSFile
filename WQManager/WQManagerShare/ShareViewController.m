@@ -15,7 +15,7 @@
     self.preferredContentSize = CGSizeMake(0, 260);
 
     UILabel *title = [UILabel new];
-    title.text = @"WQManager";
+    title.text = @"DSFile";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     title.textAlignment = NSTextAlignmentCenter;
 
@@ -26,7 +26,7 @@
     [icon.heightAnchor constraintEqualToConstant:48].active = YES;
 
     self.statusLabel = [UILabel new];
-    self.statusLabel.text = @"正在交给 WQManager…";
+    self.statusLabel.text = @"正在交给 DSFile…";
     self.statusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
     self.statusLabel.textColor = UIColor.secondaryLabelColor;
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -63,7 +63,7 @@
     NSString *typeIdentifier = nil;
     for (NSItemProvider *candidate in item.attachments ?: @[]) {
         for (NSString *identifier in candidate.registeredTypeIdentifiers) {
-            if ([identifier isEqualToString:@"com.mumu.wqmanager.backup"]) {
+            if ([identifier isEqualToString:@"com.DSFile.app.backup"]) {
                 provider = candidate;
                 typeIdentifier = identifier;
                 break;
@@ -92,9 +92,9 @@
                                          success:NO];
                 return;
             }
-            [weakSelf finishWithMessage:@"已交给 WQManager，正在打开…" success:YES];
+            [weakSelf finishWithMessage:@"已交给 DSFile，正在打开…" success:YES];
             if (![weakSelf openHostApp]) {
-                weakSelf.statusLabel.text = @"已保存。若没有自动打开，请回到 WQManager，进入备份页后会继续导入。";
+                weakSelf.statusLabel.text = @"已保存。若没有自动打开，请回到 DSFile，进入备份页后会继续导入。";
             }
         });
     }];
@@ -106,14 +106,14 @@
     self.statusLabel.textColor = UIColor.secondaryLabelColor;
     if (![self openHostApp]) {
         [self finishWithMessage:
-            @"当前签名未启用 App Group。请打开 WQManager → 备份 → 左上角导入。"
+            @"当前签名未启用 App Group。请打开 DSFile → 备份 → 左上角导入。"
                              success:NO];
     }
 }
 
 - (BOOL)openHostApp
 {
-    NSURL *url = [NSURL URLWithString:@"wqmanager://import"];
+    NSURL *url = [NSURL URLWithString:@"dsfile://import"];
     SEL selector = NSSelectorFromString(@"openURL:");
     UIResponder *responder = self;
     while ((responder = [responder nextResponder])) {

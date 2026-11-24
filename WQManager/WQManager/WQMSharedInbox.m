@@ -1,7 +1,7 @@
 #import "WQMSharedInbox.h"
 #import "WQAppsSupport.h"
 
-NSString *const WQMSharedAppGroupIdentifier = @"group.mumu.wqmanager";
+NSString *const WQMSharedAppGroupIdentifier = @"group.com.DSFile.app";
 static NSString *const kWQMInboxDirectory = @"Library/WQMImportInbox";
 static NSString *const kWQMBackupExtension = @"wqbackup";
 

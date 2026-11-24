@@ -9,7 +9,7 @@ import zlib
 from pathlib import Path
 
 udid = sys.argv[1] if len(sys.argv) > 1 else 'booted'
-container = subprocess.check_output(['xcrun', 'simctl', 'get_app_container', udid, 'mumu.pduola.WQManager', 'data'], text=True).strip()
+container = subprocess.check_output(['xcrun', 'simctl', 'get_app_container', udid, 'com.DSFile.app', 'data'], text=True).strip()
 root = Path(container) / 'tmp/WQMContainerFixture/Documents'
 root.mkdir(parents=True, exist_ok=True)
 # Reuse a fixture rather than touching any app-managed or imported user data.

@@ -2,17 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>WQMReleaseVersion</key>
-    <string>0.5.0</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh-Hans</string>
 	<key>CFBundleDisplayName</key>
-	<string>WQManager</string>
+	<string>DSFile</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleTypeName</key>
-			<string>WQManager App Backup</string>
+			<string>DSFile App Backup</string>
 			<key>CFBundleTypeExtensions</key>
 			<array>
 				<string>wqbackup</string>
@@ -27,7 +25,7 @@
 			<string>Owner</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>com.mumu.wqmanager.backup</string>
+				<string>com.DSFile.app.backup</string>
 			</array>
 		</dict>
 	</array>
@@ -35,10 +33,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.mumu.wqmanager.import</string>
+			<string>com.DSFile.app.import</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>wqmanager</string>
+				<string>dsfile</string>
 			</array>
 		</dict>
 	</array>
@@ -55,9 +53,9 @@
 				<string>public.data</string>
 			</array>
 			<key>UTTypeDescription</key>
-			<string>WQManager App Backup</string>
+			<string>DSFile App Backup</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.mumu.wqmanager.backup</string>
+			<string>com.DSFile.app.backup</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>

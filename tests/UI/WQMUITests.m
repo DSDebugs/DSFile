@@ -5,7 +5,7 @@
 - (XCUIApplication *)launchFeature:(NSString *)feature language:(NSString *)language
 {
     self.continueAfterFailure = NO;
-    XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:@"mumu.pduola.WQManager"];
+    XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.DSFile.app"];
     app.launchEnvironment = @{@"WQM_UI_FIXTURES":@"1", @"WQM_UI_FEATURE":feature,
         @"WQM_UI_APPEARANCE":[language isEqual:@"en"] ? @"dark" : @"light", @"WQM_ICON_REMOTE":@"0"};
     app.launchArguments = @[@"-WQMAcceptedDisclaimerVersion", @"2026-11-10-v1", @"-WQManagerLanguage", language];
@@ -77,7 +77,7 @@
 }
 - (void)testAppActionPanelExpandsMoreTools
 {
-    XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:@"mumu.pduola.WQManager"];
+    XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.DSFile.app"];
     app.launchEnvironment = @{@"WQM_UI_FIXTURES":@"1", @"WQM_UI_ACTION_PANEL":@"1",
         @"WQM_UI_APPEARANCE":@"light", @"WQM_ICON_REMOTE":@"0"};
     app.launchArguments = @[@"-WQMAcceptedDisclaimerVersion", @"2026-11-10-v1", @"-WQManagerLanguage", @"zh-Hans"];

@@ -18,7 +18,7 @@
     titleLabel.textAlignment = NSTextAlignmentCenter;
 
     UILabel *subtitleLabel = [UILabel new];
-    subtitleLabel.text = WQML(@"WQMANAGER_SUBTITLE", @"WQManager · 开源 App 数据管理器");
+    subtitleLabel.text = WQML(@"WQMANAGER_SUBTITLE", @"DSFile · 开源 App 数据管理器");
     subtitleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
     subtitleLabel.textColor = WQMTheme.textSecondaryColor;
     subtitleLabel.textAlignment = NSTextAlignmentCenter;

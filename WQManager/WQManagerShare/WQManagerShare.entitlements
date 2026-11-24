@@ -4,7 +4,7 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.mumu.wqmanager</string>
+		<string>group.com.DSFile.app</string>
 	</array>
 </dict>
 </plist>
